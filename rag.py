@@ -152,7 +152,7 @@ def search_knowledge_documents(query, limit_num=10, type_filter=None):
     )
     return rsp.text
 
-def retrieve_knowledge_text(query_text, num=1, is_chip=True, filter_type="product"):
+def retrieve_knowledge_text(query_text, num=1, is_chip=True, filter_type=None):
     """
     将输入文本与知识库进行匹配，返回匹配到的纯文本内容
     参数:

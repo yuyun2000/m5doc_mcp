@@ -1,5 +1,7 @@
 # m5doc_mcp
 m5官方文档的mcp服务器
+地址：https://mcp.m5stack.com/sse
+通过modelscope连接：https://www.modelscope.cn/mcp/servers/yuyun2000/m5stack-doc-server
 
 ## 安装依赖
 

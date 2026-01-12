@@ -3,8 +3,9 @@ from mcp.server import Server
 from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server.sse import SseServerTransport
-from fastapi import FastAPI, Request
-from starlette.responses import Response
+from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.responses import JSONResponse
 import uvicorn
 
 # 1. 初始化 MCP Server
@@ -79,7 +80,6 @@ async def list_tools() -> list[types.Tool]:
 async def handle_call_tool(name: str, arguments: dict | None) -> list[types.TextContent]:
     """处理工具调用"""
     if name == "knowledge_search":
-        # 获取 AI 传入的参数
         query = arguments.get("query") if arguments else None
         num = arguments.get("num", 1) if arguments else 1
         is_chip = arguments.get("is_chip", False) if arguments else False
@@ -87,7 +87,6 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
         if not query:
             return [types.TextContent(type="text", text="错误：缺少查询参数")]
         
-        # 调用你的函数
         try:
             result = retrieve_knowledge_text(query, num=num, is_chip=is_chip)
             return [types.TextContent(type="text", text=str(result))]
@@ -97,22 +96,17 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
     raise ValueError(f"Unknown tool: {name}")
 
 # ---------------------------------------------------------
-# 4. 设置 FastAPI 和 SSE 传输
+# 4. 设置 Starlette 和 SSE 传输
 # ---------------------------------------------------------
-app = FastAPI(title=app_name)
-
-# 创建 SSE transport
 sse = SseServerTransport("/messages")
 
-@app.get("/sse")
-async def handle_sse(request: Request):
-    """SSE 端点 - 用于建立连接"""
+async def handle_sse(request):
+    """SSE 端点"""
     async with sse.connect_sse(
         request.scope,
         request.receive,
         request._send
     ) as streams:
-        # ✅ 最简化的初始化方式
         init_options = InitializationOptions(
             server_name=app_name,
             server_version="0.1.0",
@@ -120,31 +114,28 @@ async def handle_sse(request: Request):
                 tools=types.ToolsCapability()
             )
         )
-        await server.run(
-            streams[0],
-            streams[1],
-            init_options
-        )
-    return Response()
+        await server.run(streams[0], streams[1], init_options)
 
+# ✅ 创建 ASGI 应用而不是普通函数
+class MessageHandler:
+    """消息处理器 - 实现 ASGI 接口"""
+    async def __call__(self, scope, receive, send):
+        await sse.handle_post_message(scope, receive, send)
 
-@app.post("/messages")
-async def handle_messages(request: Request):
-    """处理消息端点"""
-    await sse.handle_post_message(
-        request.scope,
-        request.receive,
-        request._send
-    )
-    return Response()
+async def health(request):
+    """健康检查"""
+    return JSONResponse({"status": "ok", "server": app_name})
 
-# 健康检查端点
-@app.get("/health")
-async def health():
-    return {"status": "ok", "server": app_name}
+# 创建 Starlette 应用
+app = Starlette(
+    routes=[
+        Route("/sse", endpoint=handle_sse, methods=["GET"]),
+        Route("/messages", endpoint=MessageHandler(), methods=["POST"]),  # ✅ 使用 ASGI 应用
+        Route("/health", endpoint=health, methods=["GET"]),
+    ]
+)
 
 if __name__ == "__main__":
-    # 在 5058 端口启动
     print(f"🚀 Starting {app_name} on http://0.0.0.0:5058")
     print(f"📡 SSE endpoint: http://0.0.0.0:5058/sse")
     print(f"💬 Messages endpoint: http://0.0.0.0:5058/messages")
