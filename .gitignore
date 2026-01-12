@@ -3,6 +3,10 @@ config.json
 .env
 *.env
 
+# 运行时文件
+*.pid
+*.log
+
 # Python 缓存文件
 __pycache__/
 *.py[cod]

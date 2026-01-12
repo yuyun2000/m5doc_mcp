@@ -131,7 +131,7 @@ def search_knowledge_documents(query, limit_num=10, type_filter=None):
             "rerank_only_chunk": False,
             "rerank_switch": True,
             "chunk_group": True,
-            "rerank_model": "base-multilingual-rerank",
+            "rerank_model": "Doubao-Seed-1.6-rerank",
             "retrieve_count": limit_num * 2,
             "chunk_diffusion_count": 3
         }
