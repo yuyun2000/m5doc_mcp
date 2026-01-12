@@ -1,0 +1,12 @@
+{
+    "volcengine": {
+        "ak": "your_access_key_here",
+        "sk": "your_secret_key_here",
+        "knowledge_base_domain": "api-knowledgebase.mlp.cn-beijing.volces.com",
+        "request_timeout": 30,
+        "knowledge_base_name": "m5stack",
+        "project": "default",
+        "region": "cn-north-1",
+        "service": "air"
+    }
+}
