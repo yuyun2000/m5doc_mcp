@@ -70,6 +70,12 @@ async def list_tools() -> list[types.Tool]:
                         "type": "boolean", 
                         "description": "是否需要查询芯片数据手册。当问题涉及芯片型号、数据手册、寄存器、底层电气特性时设为true；仅询问产品使用或API时设为false。默认值: false",
                         "default": False
+                    },
+                    "filter_type": {
+                        "type": "string", 
+                        "description": "过滤类型，用于指定查询特定类型的知识库文档。可选值包括：'product'（产品文档）、'product_no_eol'（在售产品文档）、'program'（编程相关文档）、'esphome'（ESPHome官方文档）。默认值: None",
+                        "enum": ["product", "product_no_eol", "program", "esphome"],
+                        "default": None
                     }
                 }
             }
@@ -83,12 +89,13 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
         query = arguments.get("query") if arguments else None
         num = arguments.get("num", 1) if arguments else 1
         is_chip = arguments.get("is_chip", False) if arguments else False
-        
+        filter_type = arguments.get("filter_type", None) if arguments else None
+
         if not query:
             return [types.TextContent(type="text", text="错误：缺少查询参数")]
         
         try:
-            result = retrieve_knowledge_text(query, num=num, is_chip=is_chip)
+            result = retrieve_knowledge_text(query, num=num, is_chip=is_chip, filter_type=filter_type)
             return [types.TextContent(type="text", text=str(result))]
         except Exception as e:
             return [types.TextContent(type="text", text=f"查询错误: {str(e)}")]
@@ -109,7 +116,7 @@ async def handle_sse(request):
     ) as streams:
         init_options = InitializationOptions(
             server_name=app_name,
-            server_version="0.1.0",
+            server_version="0.1.1",
             capabilities=types.ServerCapabilities(
                 tools=types.ToolsCapability()
             )

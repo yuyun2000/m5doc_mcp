@@ -177,6 +177,9 @@ def retrieve_knowledge_text(query_text, num=1, is_chip=True, filter_type=None):
     elif filter_type == "program":
         # 查询编程相关文档 (type=3)
         type_filter = create_type_filter([3])
+    elif filter_type == "esphome":
+        # 查询esphome官方文档 (type=11)
+        type_filter = create_type_filter([11])
     # ----------------- 其余逻辑保持不变 ---------------------
     limit_num = num * 20  # 多问一个产品或者操作就多返回10个切片
     if limit_num == 0:
