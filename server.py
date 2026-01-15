@@ -50,6 +50,11 @@ async def list_tools() -> list[types.Tool]:
   * 明确提到芯片型号、数据手册、寄存器 → true
   * 询问底层技术原理、电气特性 → true
   * 仅询问产品使用、编程API → false
+- filter_type: 指定查询的知识库类型
+  * "product": 查询所有产品文档
+    * "product_no_eol": 查询在售产品文档
+    * "program": 查询编程相关文档
+    * "esphome": 查询ESPHome官方文档
             ''',
             inputSchema={
                 "type": "object",
