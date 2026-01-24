@@ -132,8 +132,10 @@ def search_knowledge_documents(query, limit_num=10, type_filter=None):
             "rerank_switch": True,
             "chunk_group": True,
             "rerank_model": "doubao-seed-rerank",
+            "rerank_threshold": 0.55,
+            "rerank_instruction": "忽略语种差异，注意产品型号和技术参数的匹配。",
             "retrieve_count": limit_num * 2,
-            "chunk_diffusion_count": 3
+            "chunk_diffusion_count": 1
         }
     }
     
