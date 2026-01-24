@@ -131,7 +131,7 @@ def search_knowledge_documents(query, limit_num=10, type_filter=None):
             "rerank_only_chunk": False,
             "rerank_switch": True,
             "chunk_group": True,
-            "rerank_model": "base-multilingual-rerank",
+            "rerank_model": "doubao-seed-rerank",
             "retrieve_count": limit_num * 2,
             "chunk_diffusion_count": 3
         }
@@ -170,13 +170,16 @@ def retrieve_knowledge_text(query_text, num=1, is_chip=True, filter_type=None):
     type_filter = None
     if filter_type == "product":
         # 查询在售产品和EOL产品文档 (type=1,2)
-        type_filter = create_type_filter([1, 2])
+        type_filter = create_type_filter([0,1, 2])
     elif filter_type == "product_no_eol":
         # 只查询在售产品文档 (type=1)
-        type_filter = create_type_filter([1])
+        type_filter = create_type_filter([0,1])
     elif filter_type == "program":
         # 查询编程相关文档 (type=3)
-        type_filter = create_type_filter([3])
+        type_filter = create_type_filter([0,3])
+    elif filter_type == "esphome":
+        # 查询esphome官方文档 (type=11)
+        type_filter = create_type_filter([11])
     # ----------------- 其余逻辑保持不变 ---------------------
     limit_num = num * 20  # 多问一个产品或者操作就多返回10个切片
     if limit_num == 0:
