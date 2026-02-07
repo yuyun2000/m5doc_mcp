@@ -1,10 +1,43 @@
 import json
 import requests
 import os
+import logging
 from pathlib import Path
 from volcengine.auth.SignerV4 import SignerV4
 from volcengine.base.Request import Request
 from volcengine.Credentials import Credentials
+
+# 配置日志系统，确保在所有平台上输出UTF-8编码
+def setup_logging():
+    # 移除已有的handler，避免重复设置
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
+    # 创建自定义的StreamHandler子类，确保输出UTF-8编码
+    class UTF8StreamHandler(logging.StreamHandler):
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                # 确保消息以UTF-8编码输出
+                if isinstance(msg, str):
+                    msg = msg.encode('utf-8').decode('utf-8')
+                self.stream.write(msg + self.terminator)
+                self.flush()
+            except Exception:
+                self.handleError(record)
+
+    handler = UTF8StreamHandler()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[handler]
+    )
+
+setup_logging()
+
+# 创建专门的日志记录器
+logger = logging.getLogger('m5doc_rag')
 
 
 # 加载配置文件
@@ -192,21 +225,21 @@ def retrieve_knowledge_text(query_text, num=1, is_chip=True, filter_type=None):
         # 查询esphome官方文档 (type=11)
         type_filter = create_type_filter([11])
     # ----------------- 其余逻辑保持不变 ---------------------
-    limit_num = num * 20  # 多问一个产品或者操作就多返回10个切片
+    limit_num = num * 10  # 多问一个产品或者操作就多返回10个切片
     if limit_num == 0:
         limit_num = 10
-    elif limit_num > 50:
-        limit_num = 50
-    
-    print(f"\n----- 知识库查询 -----")
-    print(f"查询文本: {query_text}")
-    print(f"限制数量: {limit_num}")
-    print(f"过滤类型: {filter_type}")
-    print(f"是否查询芯片文档: {is_chip}")
-    
+    elif limit_num > 20:
+        limit_num = 20
+
+    logger.info("=== 知识库查询请求 ===")
+    logger.info(f"查询文本: {query_text}")
+    logger.info(f"限制数量: {limit_num}")
+    logger.info(f"过滤类型: {filter_type}")
+    logger.info(f"是否查询芯片文档: {is_chip}")
+
     # 调用知识库检索（查询type=1,2,3的文档）
     rsp_txt_doc = search_knowledge_documents(query_text, limit_num, type_filter)
-    print(f"知识库原始响应: {rsp_txt_doc[:200]}...")
+    logger.debug(f"知识库原始响应前200字符: {rsp_txt_doc[:200]}...")
     rsp_doc = json.loads(rsp_txt_doc)
     
     # 解析检索结果
@@ -220,7 +253,7 @@ def retrieve_knowledge_text(query_text, num=1, is_chip=True, filter_type=None):
             try:
                 rsp_data_doc = json.loads(rsp_data_doc)
             except Exception as e:
-                print(f"Error parsing product doc JSON: {e}")
+                logger.error(f"解析产品文档JSON失败: {str(e)}")
                 rsp_data_doc = {"result_list": []}
         # 提取文档内容
         for point in rsp_data_doc.get("result_list", []):
@@ -243,7 +276,7 @@ def retrieve_knowledge_text(query_text, num=1, is_chip=True, filter_type=None):
                 try:
                     rsp_data_pdf = json.loads(rsp_data_pdf)
                 except Exception as e:
-                    print(f"Error parsing PDF doc JSON: {e}")
+                    logger.error(f"解析PDF文档JSON失败: {str(e)}")
                     rsp_data_pdf = {"result_list": []}
             # 提取PDF文档内容
             for point in rsp_data_pdf.get("result_list", []):

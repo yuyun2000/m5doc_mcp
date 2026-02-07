@@ -1,4 +1,7 @@
 import asyncio
+import logging
+import traceback
+import json
 from mcp.server import Server
 from mcp.server.models import InitializationOptions
 import mcp.types as types
@@ -7,6 +10,38 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.responses import JSONResponse
 import uvicorn
+
+# 配置日志系统，确保在所有平台上输出UTF-8编码（与 rag.py 保持一致）
+def setup_logging():
+    # 移除已有的handler，避免重复设置
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
+    # 创建自定义的StreamHandler子类，确保输出UTF-8编码
+    class UTF8StreamHandler(logging.StreamHandler):
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                # 确保消息以UTF-8编码输出
+                if isinstance(msg, str):
+                    msg = msg.encode('utf-8').decode('utf-8')
+                self.stream.write(msg + self.terminator)
+                self.flush()
+            except Exception:
+                self.handleError(record)
+
+    handler = UTF8StreamHandler()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[handler]
+    )
+
+setup_logging()
+
+# 创建专门的日志记录器
+logger = logging.getLogger('m5doc_server')
 
 # 1. 初始化 MCP Server
 app_name = "m5-doc-server"
@@ -93,6 +128,10 @@ async def list_tools() -> list[types.Tool]:
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict | None) -> list[types.TextContent]:
     """处理工具调用"""
+    logger.info(f"=== 工具调用请求 ===")
+    logger.info(f"工具名称: {name}")
+    logger.info(f"调用参数: {json.dumps(arguments, ensure_ascii=False, default=str)}")
+
     if name == "knowledge_search":
         query = arguments.get("query") if arguments else None
         num = arguments.get("num", 1) if arguments else 1
@@ -100,14 +139,20 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
         filter_type = arguments.get("filter_type", None) if arguments else None
 
         if not query:
+            logger.warning("查询参数缺失")
             return [types.TextContent(type="text", text="错误：缺少查询参数")]
-        
+
         try:
+            logger.debug(f"开始知识库检索: query='{query}', num={num}, is_chip={is_chip}, filter_type='{filter_type}'")
             result = retrieve_knowledge_text(query, num=num, is_chip=is_chip, filter_type=filter_type)
+            logger.info(f"知识库检索成功，返回结果长度: {len(str(result))} 字符")
             return [types.TextContent(type="text", text=str(result))]
         except Exception as e:
+            logger.error(f"知识库检索失败: {str(e)}")
+            logger.error(f"异常堆栈跟踪: {traceback.format_exc()}")
             return [types.TextContent(type="text", text=f"查询错误: {str(e)}")]
-    
+
+    logger.error(f"未知工具调用: {name}")
     raise ValueError(f"Unknown tool: {name}")
 
 # ---------------------------------------------------------
