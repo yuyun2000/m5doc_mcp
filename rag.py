@@ -172,12 +172,21 @@ def retrieve_knowledge_text(query_text, num=1, is_chip=True, filter_type=None):
     type_filter = None
     if filter_type == "product":
         # 查询在售产品和EOL产品文档 (type=1,2)
-        type_filter = create_type_filter([0,1, 2])
+        type_filter = create_type_filter([0,1,2])
     elif filter_type == "product_no_eol":
         # 只查询在售产品文档 (type=1)
         type_filter = create_type_filter([0,1])
     elif filter_type == "program":
         # 查询编程相关文档 (type=3)
+        type_filter = create_type_filter([0,3,301,302])
+    elif filter_type == "arduino":
+        # 查询Arduino开发相关文档 (type=3)
+        type_filter = create_type_filter([0,301])
+    elif filter_type == "uiflow":
+        # 查询UIFlow开发相关文档 (type=3)
+        type_filter = create_type_filter([0,302])
+    elif filter_type == "esp-idf":
+        # 查询ESP-IDF开发相关文档 (type=3)
         type_filter = create_type_filter([0,3])
     elif filter_type == "esphome":
         # 查询esphome官方文档 (type=11)

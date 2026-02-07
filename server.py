@@ -34,7 +34,7 @@ async def list_tools() -> list[types.Tool]:
 当用户询问涉及以下任何内容时，务必调用此工具：
 1. M5Stack品牌及产品（Core、Atom、StickC、Paper、Dial、Capsule等系列）
 2. 硬件技术（模块、传感器、执行器、连接器、引脚、GPIO、接口、通讯协议如I2C/SPI/UART）
-3. 编程开发（API、UIFlow、Arduino、MicroPython、固件、库函数、代码示例）
+3. 编程开发（API、UIFlow、Arduino、MicroPython、ESP-IDF、固件、库函数、代码示例）
 4. 技术参数（电气特性、尺寸、重量、SKU、兼容性、供电、性能指标）
 5. 芯片相关（ESP32、芯片型号、数据手册、寄存器、技术规格）
 6. 产品对比、选型建议、功能差异
@@ -51,10 +51,13 @@ async def list_tools() -> list[types.Tool]:
   * 询问底层技术原理、电气特性 → true
   * 仅询问产品使用、编程API → false
 - filter_type: 指定查询的知识库类型
-  * "product": 查询所有产品文档
-    * "product_no_eol": 查询在售产品文档
-    * "program": 查询编程相关文档
-    * "esphome": 查询ESPHome官方文档
+  * "product": 查询所有产品文档（包括在售和EOL产品）
+  * "product_no_eol": 查询在售产品文档
+  * "program": 查询全品类编程相关文档（包括Arduino、UIFlow、ESP-IDF）
+  * "arduino": 专门查询Arduino开发相关文档
+  * "uiflow": 专门查询UIFlow开发相关文档
+  * "esp-idf": 专门查询ESP-IDF开发相关文档
+  * "esphome": 查询ESPHome官方文档
             ''',
             inputSchema={
                 "type": "object",
@@ -77,9 +80,9 @@ async def list_tools() -> list[types.Tool]:
                         "default": False
                     },
                     "filter_type": {
-                        "type": "string", 
-                        "description": "过滤类型，用于指定查询特定类型的知识库文档。可选值包括：'product'（产品文档）、'product_no_eol'（在售产品文档）、'program'（编程相关文档）、'esphome'（ESPHome官方文档）。默认值: None",
-                        "enum": ["product", "product_no_eol", "program", "esphome"],
+                        "type": "string",
+                        "description": "过滤类型，用于指定查询特定类型的知识库文档。可选值包括：'product'（产品文档）、'product_no_eol'（在售产品文档）、'program'（全品类编程文档）、'arduino'（Arduino开发文档）、'uiflow'（UIFlow开发文档）、'esp-idf'（ESP-IDF开发文档）、'esphome'（ESPHome官方文档）。默认值: None",
+                        "enum": ["product", "product_no_eol", "program", "arduino", "uiflow", "esp-idf", "esphome"],
                         "default": None
                     }
                 }
