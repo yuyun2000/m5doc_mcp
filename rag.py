@@ -7,32 +7,21 @@ from volcengine.auth.SignerV4 import SignerV4
 from volcengine.base.Request import Request
 from volcengine.Credentials import Credentials
 
-# 配置日志系统，确保在所有平台上输出UTF-8编码
+# 配置日志系统
 def setup_logging():
-    # 移除已有的handler，避免重复设置
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-
-    # 创建自定义的StreamHandler子类，确保输出UTF-8编码
-    class UTF8StreamHandler(logging.StreamHandler):
-        def emit(self, record):
-            try:
-                msg = self.format(record)
-                # 确保消息以UTF-8编码输出
-                if isinstance(msg, str):
-                    msg = msg.encode('utf-8').decode('utf-8')
-                self.stream.write(msg + self.terminator)
-                self.flush()
-            except Exception:
-                self.handleError(record)
-
-    handler = UTF8StreamHandler()
-
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[handler]
+        handlers=[
+            logging.StreamHandler()
+        ]
     )
+
+    # 在 Unix 系统上设置正确的输出编码
+    import sys
+    if sys.platform != 'win32':
+        import os
+        os.environ['PYTHONIOENCODING'] = 'utf-8'
 
 setup_logging()
 
@@ -231,11 +220,11 @@ def retrieve_knowledge_text(query_text, num=1, is_chip=True, filter_type=None):
     elif limit_num > 20:
         limit_num = 20
 
-    logger.info("=== 知识库查询请求 ===")
-    logger.info(f"查询文本: {query_text}")
-    logger.info(f"限制数量: {limit_num}")
-    logger.info(f"过滤类型: {filter_type}")
-    logger.info(f"是否查询芯片文档: {is_chip}")
+    logger.info("=== 知识库查询请求 ===".encode('utf-8').decode('utf-8'))
+    logger.info(f"查询文本: {query_text}".encode('utf-8').decode('utf-8'))
+    logger.info(f"限制数量: {limit_num}".encode('utf-8').decode('utf-8'))
+    logger.info(f"过滤类型: {filter_type}".encode('utf-8').decode('utf-8'))
+    logger.info(f"是否查询芯片文档: {is_chip}".encode('utf-8').decode('utf-8'))
 
     # 调用知识库检索（查询type=1,2,3的文档）
     rsp_txt_doc = search_knowledge_documents(query_text, limit_num, type_filter)

@@ -11,32 +11,21 @@ from starlette.routing import Route
 from starlette.responses import JSONResponse
 import uvicorn
 
-# 配置日志系统，确保在所有平台上输出UTF-8编码（与 rag.py 保持一致）
+# 配置日志系统（与 rag.py 保持一致）
 def setup_logging():
-    # 移除已有的handler，避免重复设置
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-
-    # 创建自定义的StreamHandler子类，确保输出UTF-8编码
-    class UTF8StreamHandler(logging.StreamHandler):
-        def emit(self, record):
-            try:
-                msg = self.format(record)
-                # 确保消息以UTF-8编码输出
-                if isinstance(msg, str):
-                    msg = msg.encode('utf-8').decode('utf-8')
-                self.stream.write(msg + self.terminator)
-                self.flush()
-            except Exception:
-                self.handleError(record)
-
-    handler = UTF8StreamHandler()
-
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[handler]
+        handlers=[
+            logging.StreamHandler()
+        ]
     )
+
+    # 在 Unix 系统上设置正确的输出编码
+    import sys
+    if sys.platform != 'win32':
+        import os
+        os.environ['PYTHONIOENCODING'] = 'utf-8'
 
 setup_logging()
 
@@ -128,9 +117,9 @@ async def list_tools() -> list[types.Tool]:
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict | None) -> list[types.TextContent]:
     """处理工具调用"""
-    logger.info(f"=== 工具调用请求 ===")
-    logger.info(f"工具名称: {name}")
-    logger.info(f"调用参数: {json.dumps(arguments, ensure_ascii=False, default=str)}")
+    logger.info("=== 工具调用请求 ===".encode('utf-8').decode('utf-8'))
+    logger.info(f"工具名称: {name}".encode('utf-8').decode('utf-8'))
+    logger.info(f"调用参数: {json.dumps(arguments, ensure_ascii=False, default=str)}".encode('utf-8').decode('utf-8'))
 
     if name == "knowledge_search":
         query = arguments.get("query") if arguments else None
@@ -139,20 +128,20 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
         filter_type = arguments.get("filter_type", None) if arguments else None
 
         if not query:
-            logger.warning("查询参数缺失")
+            logger.warning("查询参数缺失".encode('utf-8').decode('utf-8'))
             return [types.TextContent(type="text", text="错误：缺少查询参数")]
 
         try:
-            logger.debug(f"开始知识库检索: query='{query}', num={num}, is_chip={is_chip}, filter_type='{filter_type}'")
+            logger.debug(f"开始知识库检索: query='{query}', num={num}, is_chip={is_chip}, filter_type='{filter_type}'".encode('utf-8').decode('utf-8'))
             result = retrieve_knowledge_text(query, num=num, is_chip=is_chip, filter_type=filter_type)
-            logger.info(f"知识库检索成功，返回结果长度: {len(str(result))} 字符")
+            logger.info(f"知识库检索成功，返回结果长度: {len(str(result))} 字符".encode('utf-8').decode('utf-8'))
             return [types.TextContent(type="text", text=str(result))]
         except Exception as e:
-            logger.error(f"知识库检索失败: {str(e)}")
-            logger.error(f"异常堆栈跟踪: {traceback.format_exc()}")
+            logger.error(f"知识库检索失败: {str(e)}".encode('utf-8').decode('utf-8'))
+            logger.error(f"异常堆栈跟踪: {traceback.format_exc()}".encode('utf-8').decode('utf-8'))
             return [types.TextContent(type="text", text=f"查询错误: {str(e)}")]
 
-    logger.error(f"未知工具调用: {name}")
+    logger.error(f"未知工具调用: {name}".encode('utf-8').decode('utf-8'))
     raise ValueError(f"Unknown tool: {name}")
 
 # ---------------------------------------------------------
@@ -160,23 +149,19 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
 # ---------------------------------------------------------
 sse = SseServerTransport("/messages")
 
-async def handle_sse(request):
-    """SSE 端点"""
-    async with sse.connect_sse(
-        request.scope,
-        request.receive,
-        request._send
-    ) as streams:
-        init_options = InitializationOptions(
-            server_name=app_name,
-            server_version="0.1.1",
-            capabilities=types.ServerCapabilities(
-                tools=types.ToolsCapability()
+class SSEHandler:
+    """SSE 端点 - 实现 ASGI 接口，避免 Starlette 用 request_response 包装导致连接关闭时报错"""
+    async def __call__(self, scope, receive, send):
+        async with sse.connect_sse(scope, receive, send) as streams:
+            init_options = InitializationOptions(
+                server_name=app_name,
+                server_version="0.1.1",
+                capabilities=types.ServerCapabilities(
+                    tools=types.ToolsCapability()
+                )
             )
-        )
-        await server.run(streams[0], streams[1], init_options)
+            await server.run(streams[0], streams[1], init_options)
 
-# ✅ 创建 ASGI 应用而不是普通函数
 class MessageHandler:
     """消息处理器 - 实现 ASGI 接口"""
     async def __call__(self, scope, receive, send):
@@ -189,8 +174,8 @@ async def health(request):
 # 创建 Starlette 应用
 app = Starlette(
     routes=[
-        Route("/sse", endpoint=handle_sse, methods=["GET"]),
-        Route("/messages", endpoint=MessageHandler(), methods=["POST"]),  # ✅ 使用 ASGI 应用
+        Route("/sse", endpoint=SSEHandler(), methods=["GET"]),
+        Route("/messages", endpoint=MessageHandler(), methods=["POST"]),
         Route("/health", endpoint=health, methods=["GET"]),
     ]
 )
