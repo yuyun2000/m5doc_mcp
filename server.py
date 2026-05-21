@@ -65,11 +65,6 @@ async def list_tools() -> list[types.Tool]:
 7. 常见嵌入式问题解答（FAQ）、故障排除
 【参数使用指南】
 - query: 用清晰的关键词描述查询内容，必要时结合上下文重构查询语句
-- num: 根据问题涉及的实体数量设置（默认1）
-  * 询问单个产品/功能 → 1
-  * 对比2个产品 → 2
-  * 询问"有哪些"/"多少种"/"所有" → 3
-  * 多步骤操作或复杂问题 → 对应步骤数（最多5）
 - is_chip: 判断是否需要查询芯片数据手册
   * 明确提到芯片型号、数据手册、寄存器 → true
   * 询问底层技术原理、电气特性 → true
@@ -90,13 +85,6 @@ async def list_tools() -> list[types.Tool]:
                     "query": {
                         "type": "string", 
                         "description": "知识库查询文本。使用清晰的关键词，包含产品名称、技术术语或功能描述。如果用户问题模糊，需结合对话上下文优化查询语句。"
-                    },
-                    "num": {
-                        "type": "integer", 
-                        "description": "问题涉及的实体数量，影响返回结果的丰富度。单个产品/功能=1，对比2个=2，询问'有哪些/多少/所有'=3，多步骤问题=步骤数（1-5）。默认值: 1",
-                        "default": 1,
-                        "minimum": 1,
-                        "maximum": 3
                     },
                     "is_chip": {
                         "type": "boolean", 
@@ -123,7 +111,6 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
 
     if name == "knowledge_search":
         query = arguments.get("query") if arguments else None
-        num = arguments.get("num", 1) if arguments else 1
         is_chip = arguments.get("is_chip", False) if arguments else False
         filter_type = arguments.get("filter_type", None) if arguments else None
 
@@ -132,8 +119,8 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             return [types.TextContent(type="text", text="错误：缺少查询参数")]
 
         try:
-            logger.debug(f"开始知识库检索: query='{query}', num={num}, is_chip={is_chip}, filter_type='{filter_type}'".encode('utf-8').decode('utf-8'))
-            result = retrieve_knowledge_text(query, num=num, is_chip=is_chip, filter_type=filter_type)
+            logger.debug(f"开始知识库检索: query='{query}', is_chip={is_chip}, filter_type='{filter_type}'".encode('utf-8').decode('utf-8'))
+            result = retrieve_knowledge_text(query, is_chip=is_chip, filter_type=filter_type)
             logger.info(f"知识库检索成功，返回结果长度: {len(str(result))} 字符".encode('utf-8').decode('utf-8'))
             return [types.TextContent(type="text", text=str(result))]
         except Exception as e:

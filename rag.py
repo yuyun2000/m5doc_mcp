@@ -54,6 +54,7 @@ KNOWLEDGE_BASE_NAME = _config['knowledge_base_name']
 PROJECT = _config['project']
 REGION = _config['region']
 SERVICE = _config['service']
+DEFAULT_RESULT_LIMIT = 10
 
 def prepare_request(method, path, params=None, data=None, doseq=0):
     """
@@ -176,12 +177,11 @@ def search_knowledge_documents(query, limit_num=10, type_filter=None):
     )
     return rsp.text
 
-def retrieve_knowledge_text(query_text, num=1, is_chip=True, filter_type=None):
+def retrieve_knowledge_text(query_text, *legacy_args, is_chip=True, filter_type=None, **legacy_kwargs):
     """
     将输入文本与知识库进行匹配，返回匹配到的纯文本内容
     参数:
         query_text (str): 输入知识库查询的文本
-        num (int): 用户问题中设计的产品数量或者操作数量
         is_chip(bool): 用户问题中是否涉及芯片（现在用于决定是否查询PDF文档）
         filter_type (str): 过滤类型
             - "product": 查询产品文档（type=1:在售产品, type=2:EOL产品）
@@ -190,6 +190,16 @@ def retrieve_knowledge_text(query_text, num=1, is_chip=True, filter_type=None):
     返回:
         dict: 包含匹配到的知识库内容的字典
     """
+    # Ignore legacy num arguments; always return the first 10 results.
+    if len(legacy_args) >= 2:
+        is_chip = legacy_args[1]
+    if len(legacy_args) >= 3:
+        filter_type = legacy_args[2]
+    if "is_chip" in legacy_kwargs:
+        is_chip = legacy_kwargs["is_chip"]
+    if "filter_type" in legacy_kwargs:
+        filter_type = legacy_kwargs["filter_type"]
+
     # ----------------- 过滤条件映射 ---------------------
     type_filter = None
     if filter_type == "product":
@@ -214,11 +224,7 @@ def retrieve_knowledge_text(query_text, num=1, is_chip=True, filter_type=None):
         # 查询esphome官方文档 (type=11)
         type_filter = create_type_filter([11])
     # ----------------- 其余逻辑保持不变 ---------------------
-    limit_num = num * 10  # 多问一个产品或者操作就多返回10个切片
-    if limit_num == 0:
-        limit_num = 10
-    elif limit_num > 20:
-        limit_num = 20
+    limit_num = DEFAULT_RESULT_LIMIT
 
     logger.info("=== 知识库查询请求 ===".encode('utf-8').decode('utf-8'))
     logger.info(f"查询文本: {query_text}".encode('utf-8').decode('utf-8'))
@@ -283,12 +289,12 @@ if __name__ == "__main__":
     
     # 查询产品文档
     print("=== 查询产品文档 ===")
-    result_product = retrieve_knowledge_text(query, 1, is_chip=True, filter_type="product")
+    result_product = retrieve_knowledge_text(query, is_chip=True, filter_type="product")
     print("查询结果:")
     print(result_product['info'])
     
     # 查询芯片文档
     # print("\n=== 查询芯片文档 ===")
-    # result_chip = retrieve_knowledge_text("芯片手册", 10, is_chip=True, filter_type="product")
+    # result_chip = retrieve_knowledge_text("芯片手册", is_chip=True, filter_type="product")
     # print("查询结果:")
     # print(result_chip['info'][:500] + "..." if len(result_chip['info']) > 500 else result_chip['info'])
