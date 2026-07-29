@@ -29,7 +29,11 @@ DEFAULT_TLS_ENDPOINT = "tls-cn-beijing.volces.com"
 DEFAULT_TLS_REGION = "cn-beijing"
 DEFAULT_TLS_TOPIC_ID = ""
 DEFAULT_TRUSTED_PROXIES = ("127.0.0.1/32", "::1/128")
+DEFAULT_MESSAGE_LOG_INTERVAL_SECONDS = 60.0
+DEFAULT_MESSAGE_LOG_MAX_KEYS = 20000
+MAX_JSONRPC_METHOD_BODY_BYTES = 64 * 1024
 PLACEHOLDER_PREFIXES = ("your_", "change_")
+JSONRPC_METHOD_RE = re.compile(r"[A-Za-z0-9_.:/-]{1,128}")
 
 REQUEST_METADATA: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
     "m5doc_request_metadata",
@@ -116,6 +120,8 @@ class CloudLogConfig:
     trusted_proxies: tuple[str, ...]
     fingerprint_salt: str
     collect_client_ip: bool
+    message_log_interval_seconds: float = DEFAULT_MESSAGE_LOG_INTERVAL_SECONDS
+    message_log_max_keys: int = DEFAULT_MESSAGE_LOG_MAX_KEYS
 
     @property
     def configured(self) -> bool:
@@ -197,6 +203,20 @@ def load_cloud_log_config() -> CloudLogConfig:
             "M5DOC_TLS_COLLECT_CLIENT_IP",
             bool(section.get("collect_client_ip", True)),
         ),
+        message_log_interval_seconds=_env_float(
+            "M5DOC_TLS_MESSAGE_LOG_INTERVAL_SECONDS",
+            float(
+                section.get(
+                    "message_log_interval_seconds",
+                    DEFAULT_MESSAGE_LOG_INTERVAL_SECONDS,
+                )
+            ),
+            minimum=0.0,
+        ),
+        message_log_max_keys=_env_int(
+            "M5DOC_TLS_MESSAGE_LOG_MAX_KEYS",
+            int(section.get("message_log_max_keys", DEFAULT_MESSAGE_LOG_MAX_KEYS)),
+        ),
     )
 
 
@@ -240,6 +260,7 @@ class AsyncCloudLogger:
         self._uploaded = 0
         self._upload_failures = 0
         self._batches_uploaded = 0
+        self._suppressed_transport_logs = 0
         self._last_success_at = 0.0
         self._last_error_type = ""
         self._active = {"http": 0, "tool": 0}
@@ -323,6 +344,10 @@ class AsyncCloudLogger:
             self._active[kind] = max(0, self._active.get(kind, 0) - 1)
             return self._active[kind]
 
+    def record_suppressed_transport_log(self) -> None:
+        with self._lock:
+            self._suppressed_transport_logs += 1
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -335,6 +360,7 @@ class AsyncCloudLogger:
                 "uploaded": self._uploaded,
                 "upload_failures": self._upload_failures,
                 "batches_uploaded": self._batches_uploaded,
+                "suppressed_transport_logs": self._suppressed_transport_logs,
                 "last_success_at": int(self._last_success_at) if self._last_success_at else None,
                 "last_error_type": self._last_error_type or None,
                 "active_http": self._active["http"],
@@ -530,10 +556,66 @@ def request_metadata_from_scope(scope: dict[str, Any], config: CloudLogConfig) -
     return metadata
 
 
+def _jsonrpc_method_from_body(body: bytes, complete: bool, truncated: bool) -> str:
+    """Return only the top-level JSON-RPC method, never params or body text."""
+    if not complete or truncated or not body:
+        return ""
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, ValueError, TypeError):
+        return ""
+    if not isinstance(payload, dict):
+        return "batch" if isinstance(payload, list) else ""
+    method = payload.get("method")
+    if not isinstance(method, str):
+        return ""
+    return method if JSONRPC_METHOD_RE.fullmatch(method) else "invalid"
+
+
+@dataclass
+class _MessageLogSample:
+    window_started: float
+    suppressed: int = 0
+
+
+class _SuccessfulMessageLogSampler:
+    """Bound successful legacy transport logs without affecting MCP traffic."""
+
+    def __init__(self, interval_seconds: float, max_keys: int) -> None:
+        self.interval_seconds = max(0.0, interval_seconds)
+        self.max_keys = max(1, max_keys)
+        self._samples: dict[tuple[str, str], _MessageLogSample] = {}
+        self._lock = threading.Lock()
+
+    def select(self, fingerprint: str, method: str) -> tuple[bool, int]:
+        if self.interval_seconds <= 0:
+            return True, 0
+
+        now = time.monotonic()
+        key = (fingerprint, method)
+        with self._lock:
+            sample = self._samples.get(key)
+            if sample and now - sample.window_started < self.interval_seconds:
+                sample.suppressed += 1
+                return False, 0
+
+            previously_suppressed = sample.suppressed if sample else 0
+            if sample:
+                self._samples.pop(key, None)
+            elif len(self._samples) >= self.max_keys:
+                self._samples.pop(next(iter(self._samples)))
+            self._samples[key] = _MessageLogSample(window_started=now)
+            return True, previously_suppressed
+
+
 class RequestTelemetryMiddleware:
     def __init__(self, app: Any, uploader: AsyncCloudLogger) -> None:
         self.app = app
         self.uploader = uploader
+        self._message_sampler = _SuccessfulMessageLogSampler(
+            uploader.config.message_log_interval_seconds,
+            uploader.config.message_log_max_keys,
+        )
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") != "http":
@@ -546,6 +628,35 @@ class RequestTelemetryMiddleware:
         active, peak = self.uploader.activity_enter("http")
         status_code = 500
         response_bytes = 0
+        path = str(scope.get("path", ""))
+        observe_jsonrpc_method = (
+            str(scope.get("method", "")).upper() == "POST"
+            and path in {"/messages", "/messages/"}
+        )
+        request_body = bytearray()
+        request_body_complete = False
+        request_body_truncated = False
+
+        async def receive_wrapper() -> dict[str, Any]:
+            nonlocal request_body_complete, request_body_truncated
+            message = await receive()
+            if observe_jsonrpc_method and message.get("type") == "http.request":
+                body = message.get("body", b"")
+                remaining = MAX_JSONRPC_METHOD_BODY_BYTES - len(request_body)
+                if remaining > 0:
+                    request_body.extend(body[:remaining])
+                if len(body) > remaining:
+                    request_body_truncated = True
+                if not message.get("more_body", False):
+                    request_body_complete = True
+                    method = _jsonrpc_method_from_body(
+                        bytes(request_body),
+                        request_body_complete,
+                        request_body_truncated,
+                    )
+                    if method:
+                        metadata["mcp_jsonrpc_method"] = method
+            return message
 
         async def send_wrapper(message: dict[str, Any]) -> None:
             nonlocal status_code, response_bytes
@@ -556,7 +667,11 @@ class RequestTelemetryMiddleware:
             await send(message)
 
         try:
-            await self.app(scope, receive, send_wrapper)
+            await self.app(
+                scope,
+                receive_wrapper if observe_jsonrpc_method else receive,
+                send_wrapper,
+            )
         except Exception:
             self.uploader.emit(
                 "http_request_error",
@@ -566,14 +681,32 @@ class RequestTelemetryMiddleware:
             raise
         finally:
             remaining = self.uploader.activity_exit("http")
-            path = str(scope.get("path", ""))
             # Generic MCP/Node clients commonly probe OAuth discovery variants.
             # Without OAuth configured these 404s are expected and have no usage value.
             ignore_oauth_probe = (
                 status_code == 404
                 and path.startswith("/.well-known/oauth-protected-resource")
             )
-            if not ignore_oauth_probe:
+            should_emit = not ignore_oauth_probe
+            sampling_fields: dict[str, Any] = {}
+            successful_message_post = (
+                observe_jsonrpc_method and 200 <= status_code < 300
+            )
+            if should_emit and successful_message_post:
+                jsonrpc_method = metadata.get("mcp_jsonrpc_method", "unknown")
+                should_emit, previously_suppressed = self._message_sampler.select(
+                    metadata.get("client_fingerprint", ""),
+                    jsonrpc_method,
+                )
+                if should_emit:
+                    sampling_fields = {
+                        "transport_log_sampled": True,
+                        "sample_interval_seconds": self._message_sampler.interval_seconds,
+                        "suppressed_since_previous_sample": previously_suppressed,
+                    }
+                else:
+                    self.uploader.record_suppressed_transport_log()
+            if should_emit:
                 self.uploader.emit(
                     "http_request",
                     **metadata,
@@ -583,6 +716,7 @@ class RequestTelemetryMiddleware:
                     active_http_at_start=active,
                     peak_http=peak,
                     active_http_after=remaining,
+                    **sampling_fields,
                 )
             REQUEST_METADATA.reset(token)
 

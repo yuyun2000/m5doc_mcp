@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -12,6 +13,7 @@ from cloud_logging import (
     CloudLogHandler,
     RequestTelemetryMiddleware,
     _credential_setting,
+    _jsonrpc_method_from_body,
     redact_log_message,
     request_metadata_from_scope,
     resolve_client_ip_from_scope,
@@ -37,6 +39,8 @@ def make_config(**overrides):
         "trusted_proxies": ("127.0.0.1/32", "::1/128"),
         "fingerprint_salt": "unit-test-salt",
         "collect_client_ip": True,
+        "message_log_interval_seconds": 60,
+        "message_log_max_keys": 100,
     }
     values.update(overrides)
     return CloudLogConfig(**values)
@@ -185,8 +189,114 @@ class CloudLoggingTests(unittest.TestCase):
         self.assertEqual(payload["event"], "application_log")
         self.assertNotIn("secret-value", payload["message"])
 
+    def test_jsonrpc_method_rejects_arbitrary_client_text(self):
+        body = b'{"jsonrpc":"2.0","method":"private user question"}'
+
+        self.assertEqual(_jsonrpc_method_from_body(body, True, False), "invalid")
+
 
 class RequestTelemetryTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _message_scope():
+        return {
+            "type": "http",
+            "client": ("198.51.100.10", 50000),
+            "headers": [
+                (b"host", b"mcp.m5stack.com"),
+                (b"user-agent", b"Cursor/3.13.10"),
+            ],
+            "method": "POST",
+            "path": "/messages/",
+            "scheme": "https",
+            "http_version": "1.1",
+        }
+
+    async def test_successful_message_posts_are_sampled_by_client_and_method(self):
+        logger = AsyncCloudLogger(make_config(enabled=False))
+        emitted = []
+        logger.emit = lambda event, **fields: emitted.append((event, fields)) or True
+        bodies_seen = []
+
+        async def downstream(_scope, receive, send):
+            chunks = []
+            while True:
+                message = await receive()
+                chunks.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            bodies_seen.append(b"".join(chunks))
+            await send({"type": "http.response.start", "status": 202, "headers": []})
+            await send({"type": "http.response.body", "body": b"Accepted"})
+
+        middleware = RequestTelemetryMiddleware(downstream, logger)
+        payload = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"arguments": {"query": "private-user-question"}},
+            }
+        ).encode()
+
+        async def run_request():
+            split = len(payload) // 2
+            messages = [
+                {"type": "http.request", "body": payload[:split], "more_body": True},
+                {"type": "http.request", "body": payload[split:], "more_body": False},
+            ]
+
+            async def receive():
+                return messages.pop(0)
+
+            async def send(_message):
+                return None
+
+            await middleware(self._message_scope(), receive, send)
+
+        await run_request()
+        await run_request()
+
+        self.assertEqual(bodies_seen, [payload, payload])
+        self.assertEqual(len(emitted), 1)
+        event, fields = emitted[0]
+        self.assertEqual(event, "http_request")
+        self.assertEqual(fields["mcp_jsonrpc_method"], "tools/call")
+        self.assertTrue(fields["transport_log_sampled"])
+        self.assertNotIn("private-user-question", repr(fields))
+        self.assertEqual(logger.status()["suppressed_transport_logs"], 1)
+
+    async def test_message_post_errors_are_never_sampled(self):
+        logger = AsyncCloudLogger(make_config(enabled=False))
+        emitted = []
+        logger.emit = lambda event, **fields: emitted.append((event, fields)) or True
+
+        async def downstream(_scope, receive, send):
+            await receive()
+            await send({"type": "http.response.start", "status": 400, "headers": []})
+            await send({"type": "http.response.body", "body": b"Bad Request"})
+
+        middleware = RequestTelemetryMiddleware(downstream, logger)
+        payload = b'{"jsonrpc":"2.0","method":"ping"}'
+
+        async def run_request():
+            async def receive():
+                return {"type": "http.request", "body": payload, "more_body": False}
+
+            async def send(_message):
+                return None
+
+            await middleware(self._message_scope(), receive, send)
+
+        await run_request()
+        await run_request()
+
+        self.assertEqual(len(emitted), 2)
+        self.assertTrue(all(fields["status_code"] == 400 for _, fields in emitted))
+        self.assertTrue(
+            all("transport_log_sampled" not in fields for _, fields in emitted)
+        )
+        self.assertEqual(logger.status()["suppressed_transport_logs"], 0)
+
     async def test_expected_oauth_discovery_404_is_not_uploaded(self):
         logger = AsyncCloudLogger(make_config(enabled=False))
         emitted = []

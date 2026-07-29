@@ -33,7 +33,9 @@
         "access_key": "your_tls_access_key_here",
         "secret_key": "your_tls_secret_key_here",
         "topic_id": "your_tls_topic_id_here",
-        "source": "m5doc-mcp"
+        "source": "m5doc-mcp",
+        "message_log_interval_seconds": 60,
+        "message_log_max_keys": 20000
     },
     "rate_limit": {
         "enabled": true,

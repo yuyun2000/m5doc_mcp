@@ -64,6 +64,8 @@ TLS 云日志配置可使用环境变量覆盖：
 - `M5DOC_TLS_TRUSTED_PROXIES`
 - `M5DOC_TLS_FINGERPRINT_SALT`
 - `M5DOC_TLS_COLLECT_CLIENT_IP`
+- `M5DOC_TLS_MESSAGE_LOG_INTERVAL_SECONDS`
+- `M5DOC_TLS_MESSAGE_LOG_MAX_KEYS`
 - `M5DOC_LOG_INPUT_MAX_CHARS`
 
 来源 IP 限流可使用环境变量覆盖：
@@ -154,6 +156,7 @@ python -m py_compile server.py rag.py ai_answer.py cloud_logging.py rate_limit.p
 - 用量日志可记录可信代理解析后的 IP、User-Agent、会话/协议元数据和加盐指纹；指纹只用于统计，不得作为限流键。限流必须仅按解析后的来源 IP，每个 IP 额度互相独立，`47.113.125.164` 始终绕过限流。
 - 仅信任 `trusted_proxies` 中代理提供的 `X-Forwarded-For` / `X-Real-IP`，避免直接客户端伪造来源 IP。
 - 当前限流器是单进程内存状态；启用多个 Uvicorn worker 或多实例前必须改用 Redis 等共享状态，避免每个进程各自计算额度。
+- legacy SSE 的成功 `/messages` HTTP 遥测按客户端指纹和顶层 JSON-RPC `method` 采样；不得记录 `params` 或完整协议请求体。工具用量必须以 `mcp_tool_call` 统计，反馈以 `knowledge_feedback` 统计，非 2xx 和异常请求不得采样丢弃。
 
 ## 安全要求
 

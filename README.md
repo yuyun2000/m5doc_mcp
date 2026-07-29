@@ -68,7 +68,9 @@ cp config.example.json config.json
     "access_key": "your_tls_access_key_here",
     "secret_key": "your_tls_secret_key_here",
     "topic_id": "your_tls_topic_id_here",
-    "source": "m5doc-mcp"
+    "source": "m5doc-mcp",
+    "message_log_interval_seconds": 60,
+    "message_log_max_keys": 20000
   },
   "rate_limit": {
     "enabled": true,
@@ -115,6 +117,9 @@ cp config.example.json config.json
 - 日志队列满、TLS 超时或云端故障时，业务请求继续执行；`/health` 的 `cloud_logging` 字段会显示队列、丢弃、上传失败和并发状态。
 - 如当地隐私政策不允许保存原始 IP，可设置 `M5DOC_TLS_COLLECT_CLIENT_IP=false`；加盐指纹仍可用于近似去重统计。
 - 未配置 OAuth 时，`/.well-known/oauth-protected-resource*` 的预期 404 探测不会上传，避免无效日志占量；其他异常请求仍正常记录。
+- legacy SSE 的成功 `POST /messages` 只是 JSON-RPC 上行传输确认，不能直接作为工具用量。服务只提取顶层 `method`，按“客户端指纹 + method”每 60 秒最多上传一条 HTTP 样本；`params` 和请求体不会进入该 HTTP 日志。被抑制总数可在 `/health` 的 `cloud_logging.suppressed_transport_logs` 查看。
+- 工具用量以 `mcp_tool_call` 为准，反馈以 `knowledge_feedback` 为准；所有非 2xx `/messages`、未处理异常、限流和工具错误仍逐条记录，不参与采样。
+- 可用 `M5DOC_TLS_MESSAGE_LOG_INTERVAL_SECONDS` 调整采样窗口，设为 `0` 可恢复逐条记录；`M5DOC_TLS_MESSAGE_LOG_MAX_KEYS` 控制采样状态的内存上限。
 
 ### 按来源 IP 限流
 
