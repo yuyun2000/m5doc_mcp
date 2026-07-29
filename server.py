@@ -1,21 +1,28 @@
+"""M5Stack documentation MCP service built on the official MCP SDK v2."""
+
+from __future__ import annotations
+
 import asyncio
 import contextlib
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-import inspect
 import logging
 import os
 import time
 import uuid
-from mcp.server import Server
-import mcp.types as types
-from mcp.server.sse import SseServerTransport
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from starlette.applications import Starlette
-from starlette.routing import Route
-from starlette.responses import JSONResponse
-import uvicorn
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from typing import Annotated, Literal
 
+import uvicorn
+from mcp import types
+from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
+from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import BaseModel, Field
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+from ai_answer import AIAnswerError, answer_question
 from cloud_logging import (
     REQUEST_METADATA,
     RequestTelemetryMiddleware,
@@ -24,53 +31,73 @@ from cloud_logging import (
     redact_sensitive_text,
     resolve_client_ip_from_scope,
 )
+from mcp_config import load_mcp_server_config
+from rag import retrieve_knowledge_text
 from rate_limit import PerIpRateLimitMiddleware, rate_limiter
 
 configure_cloud_logging(cloud_logger)
+logger = logging.getLogger("m5doc_server")
 
-# 创建专门的日志记录器
-logger = logging.getLogger('m5doc_server')
-
-# 1. 初始化 MCP Server
-app_name = "m5-doc-server"
-server = Server(app_name, version="0.2.0")
+APP_NAME = "m5-doc-server"
+APP_VERSION = "1.0.0"
+AI_ANSWER_TOOL_NAME = "knowledge_answer"
+FEEDBACK_TOOL_NAME = "knowledge_feedback"
+MAX_LOG_INPUT_CHARS = int(os.getenv("M5DOC_LOG_INPUT_MAX_CHARS", "20000"))
 
 MCP_TOOL_WORKERS = int(os.getenv("M5DOC_MCP_TOOL_WORKERS", "32"))
 MCP_TOOL_TIMEOUT = float(os.getenv("M5DOC_MCP_TOOL_TIMEOUT", "90"))
 MCP_TOOL_QUEUE_TIMEOUT = float(os.getenv("M5DOC_MCP_TOOL_QUEUE_TIMEOUT", "5"))
-
-tool_executor = ThreadPoolExecutor(
-    max_workers=MCP_TOOL_WORKERS,
-    thread_name_prefix="m5doc-tool",
-)
-tool_semaphore = asyncio.Semaphore(MCP_TOOL_WORKERS)
-
-# ---------------------------------------------------------
-# 2. 定义你的函数 
-# ---------------------------------------------------------
-from ai_answer import AIAnswerError, answer_question
-from rag import retrieve_knowledge_text
-
 AI_TOOL_WORKERS = int(os.getenv("M5DOC_AI_TOOL_WORKERS", "8"))
 AI_TOOL_TIMEOUT = float(os.getenv("M5DOC_AI_TOOL_TIMEOUT", "260"))
 AI_TOOL_QUEUE_TIMEOUT = float(os.getenv("M5DOC_AI_TOOL_QUEUE_TIMEOUT", "5"))
 
+tool_executor = ThreadPoolExecutor(
+    max_workers=MCP_TOOL_WORKERS, thread_name_prefix="m5doc-tool"
+)
+tool_semaphore = asyncio.Semaphore(MCP_TOOL_WORKERS)
 ai_tool_executor = ThreadPoolExecutor(
-    max_workers=AI_TOOL_WORKERS,
-    thread_name_prefix="m5doc-ai-tool",
+    max_workers=AI_TOOL_WORKERS, thread_name_prefix="m5doc-ai-tool"
 )
 ai_tool_semaphore = asyncio.Semaphore(AI_TOOL_WORKERS)
-
-AI_ANSWER_TOOL_NAME = "knowledge_answer"
-FEEDBACK_TOOL_NAME = "knowledge_feedback"
-MAX_LOG_INPUT_CHARS = int(os.getenv("M5DOC_LOG_INPUT_MAX_CHARS", "20000"))
 
 
 class ToolQueueTimeout(Exception):
     """Raised when all workers stay occupied past the admission timeout."""
 
 
+class BasicToolOutput(BaseModel):
+    text: str
+    outcome: str
+
+
+class FeedbackToolOutput(BasicToolOutput):
+    accepted: bool
+    feedback_id: str | None = None
+
+
+FilterType = Literal[
+    "product",
+    "product_no_eol",
+    "program",
+    "arduino",
+    "uiflow",
+    "esp-idf",
+    "esphome",
+]
+FeedbackCategory = Literal[
+    "missing_documentation",
+    "incorrect_information",
+    "unsupported_feature",
+    "broken_example",
+    "tool_error",
+    "other",
+]
+FeedbackSeverity = Literal["low", "medium", "high"]
+FeedbackSourceTool = Literal["knowledge_search", "knowledge_answer", "other"]
+
+
 async def run_blocking_tool(semaphore, executor, call, timeout, queue_timeout):
+    """Run blocking work with bounded admission and a non-leaking timeout."""
     try:
         await asyncio.wait_for(semaphore.acquire(), timeout=queue_timeout)
     except asyncio.TimeoutError as exc:
@@ -81,8 +108,14 @@ async def run_blocking_tool(semaphore, executor, call, timeout, queue_timeout):
     try:
         return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
     except asyncio.TimeoutError:
-        # The worker thread cannot be cancelled safely. Keep its admission slot
-        # until the underlying call really exits so overload cannot grow silently.
+        # Python cannot safely cancel a running thread. Retain its admission slot
+        # until it exits so repeated timeouts cannot grow unbounded work.
+        future.add_done_callback(lambda _future: semaphore.release())
+        release_on_return = False
+        raise
+    except asyncio.CancelledError:
+        # A disconnected client cancels only the coroutine, not the worker thread.
+        # Keep accounting for that worker until the blocking call actually exits.
         future.add_done_callback(lambda _future: semaphore.release())
         release_on_return = False
         raise
@@ -91,19 +124,22 @@ async def run_blocking_tool(semaphore, executor, call, timeout, queue_timeout):
             semaphore.release()
 
 
-def current_mcp_metadata() -> dict[str, str]:
-    try:
-        context = server.request_context
-    except LookupError:
+def current_mcp_metadata(ctx: Context | None = None) -> dict[str, str]:
+    if ctx is None:
         return {}
-    params = context.session.client_params
-    client_info = params.clientInfo if params else None
-    return {
-        "mcp_request_id": str(context.request_id),
-        "mcp_protocol_version": str(params.protocolVersion) if params else "",
-        "mcp_client_name": str(client_info.name) if client_info else "",
-        "mcp_client_version": str(client_info.version) if client_info else "",
-    }
+    try:
+        params = ctx.session.client_params
+        client_info = getattr(params, "client_info", None) or getattr(
+            params, "clientInfo", None
+        )
+        return {
+            "mcp_request_id": ctx.request_id,
+            "mcp_protocol_version": str(ctx.protocol_version or ""),
+            "mcp_client_name": str(getattr(client_info, "name", "") or ""),
+            "mcp_client_version": str(getattr(client_info, "version", "") or ""),
+        }
+    except (AttributeError, LookupError, ValueError):
+        return {}
 
 
 def bounded_log_text(value, limit: int = MAX_LOG_INPUT_CHARS) -> tuple[str, bool]:
@@ -115,160 +151,58 @@ def feedback_text(arguments: dict | None, key: str, limit: int) -> tuple[str, bo
     value = arguments.get(key) if arguments else None
     return bounded_log_text(str(value or "").strip(), limit)
 
-# 3. 注册为 MCP 工具
-@server.list_tools()
-async def list_tools() -> list[types.Tool]:
-    """列出可用工具。"""
-    return [
-        types.Tool(
-            name="knowledge_search",
-            description='''从M5Stack产品知识库中检索相关信息。这是一个专业的M5Stack产品、硬件、编程和芯片数据库查询工具。
-【核心功能】
-- 查询M5Stack产品的技术规格、参数、功能特性
-- 检索产品兼容性、连接方式、引脚定义
-- 获取编程API、代码示例、固件配置信息
-- 查找芯片数据手册和技术细节
-【必须触发此工具的场景】
-当用户询问涉及以下任何内容时，务必调用此工具：
-1. M5Stack品牌及产品（Core、Atom、StickC、Paper、Dial、Capsule等系列）
-2. 硬件技术（模块、传感器、执行器、连接器、引脚、GPIO、接口、通讯协议如I2C/SPI/UART）
-3. 编程开发（API、UIFlow、Arduino、MicroPython、ESP-IDF、固件、库函数、代码示例）
-4. 技术参数（电气特性、尺寸、重量、SKU、兼容性、供电、性能指标）
-5. 芯片相关（ESP32、芯片型号、数据手册、寄存器、技术规格）
-6. 产品对比、选型建议、功能差异
-7. 常见嵌入式问题解答（FAQ）、故障排除
-【参数使用指南】
-- query: 用清晰的关键词描述查询内容，必要时结合上下文重构查询语句
-- is_chip: 判断是否需要查询芯片数据手册
-  * 明确提到芯片型号、数据手册、寄存器 → true
-  * 询问底层技术原理、电气特性 → true
-  * 仅询问产品使用、编程API → false
-- filter_type: 指定查询的知识库类型
-  * "product": 查询所有产品文档（包括在售和EOL产品）
-  * "product_no_eol": 查询在售产品文档
-  * "program": 查询全品类编程相关文档（包括Arduino、UIFlow、ESP-IDF）
-  * "arduino": 专门查询Arduino开发相关文档
-  * "uiflow": 专门查询UIFlow开发相关文档
-  * "esp-idf": 专门查询ESP-IDF开发相关文档
-  * "esphome": 查询ESPHome官方文档
-            ''',
-            inputSchema={
-                "type": "object",
-                "required": ["query"],
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "知识库查询文本。使用清晰的关键词，包含产品名称、技术术语或功能描述。如果用户问题模糊，需结合对话上下文优化查询语句。"
-                    },
-                    "is_chip": {
-                        "type": "boolean",
-                        "description": "是否需要查询芯片数据手册。当问题涉及芯片型号、数据手册、寄存器、底层电气特性时设为true；仅询问产品使用或API时设为false。默认值: false",
-                        "default": False
-                    },
-                    "filter_type": {
-                        "type": "string",
-                        "description": "过滤类型，用于指定查询特定类型的知识库文档。可选值包括：'product'（产品文档）、'product_no_eol'（在售产品文档）、'program'（全品类编程文档）、'arduino'（Arduino开发文档）、'uiflow'（UIFlow开发文档）、'esp-idf'（ESP-IDF开发文档）、'esphome'（ESPHome官方文档）。默认值: None",
-                        "enum": ["product", "product_no_eol", "program", "arduino", "uiflow", "esp-idf", "esphome"],
-                        "default": None
-                    }
-                }
-            }
-        ),
-        types.Tool(
-            name=AI_ANSWER_TOOL_NAME,
-            description='''调用 M5Stack FAE AI 生成专业回复，而不是直接返回杂乱的知识库片段。
-【核心功能】
-- 将用户原始问题直接发送给 M5Stack FAE 模型，由模型整理并输出完整答案
-- 适合需要最终结论、故障排查步骤、选型建议、代码/API解释、产品使用说明的场景
-- 返回内容是模型生成的专业回复，不包含原始检索片段
-【使用建议】
-- 当用户明确需要“直接回答”“帮我整理”“给出方案”“解释原因”时优先使用此工具
-- 如果用户只需要快速检索原文资料、引用片段或低延迟查询，使用 knowledge_search
-- 此工具可能耗时 1 分钟甚至更久；只要没有返回错误，客户端应继续等待
-【参数】
-- question: 用户发来的原始问题。除非必须补全上下文，否则不要把大量检索片段拼进去。
-            ''',
-            inputSchema={
-                "type": "object",
-                "required": ["question"],
-                "properties": {
-                    "question": {
-                        "type": "string",
-                        "description": "用户原始问题，会直接转发给 M5Stack FAE AI 生成专业回复。"
-                    }
-                }
-            }
-        ),
-        types.Tool(
-            name=FEEDBACK_TOOL_NAME,
-            description='''向 M5Stack 提交知识库缺失、错误、功能未覆盖或文档问题，供人工评估和后续补充。
-【强烈建议反馈的场景】
-- knowledge_search 没有找到用户需要的产品功能、API、接线、示例或说明
-- knowledge_answer 无法回答，或现有资料疑似过期、错误、互相矛盾
-- 发现 M5Stack 产品、SDK、UIFlow2、Arduino、ESP-IDF 文档中的 bug 或缺失步骤
-- Agent 判断某个高频问题值得 M5Stack FAE 人工补充
-【反馈原则】
-- 鼓励 Agent 主动、大胆反馈真实问题，不必等用户明确要求
-- 清楚写明缺少什么、哪里可能错误、期望补充什么
-- 反馈将上传到 M5Stack 云日志并进入人工评估流程
-            ''',
-            inputSchema={
-                "type": "object",
-                "required": ["category", "feedback"],
-                "properties": {
-                    "category": {
-                        "type": "string",
-                        "enum": [
-                            "missing_documentation",
-                            "incorrect_information",
-                            "unsupported_feature",
-                            "broken_example",
-                            "tool_error",
-                            "other"
-                        ],
-                        "description": "反馈分类。"
-                    },
-                    "feedback": {
-                        "type": "string",
-                        "minLength": 10,
-                        "maxLength": 8000,
-                        "description": "具体问题、缺失内容或疑似 bug，请提供足够信息供人工复现和评估。"
-                    },
-                    "original_question": {
-                        "type": "string",
-                        "maxLength": 8000,
-                        "description": "触发本次反馈的用户原始问题，可选。"
-                    },
-                    "product": {
-                        "type": "string",
-                        "maxLength": 200,
-                        "description": "相关产品、芯片、Unit、Module 或 SDK 名称，可选。"
-                    },
-                    "expected_information": {
-                        "type": "string",
-                        "maxLength": 4000,
-                        "description": "期望 M5Stack 后续补充或修正的资料，可选。"
-                    },
-                    "severity": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high"],
-                        "default": "medium",
-                        "description": "问题影响程度。"
-                    },
-                    "source_tool": {
-                        "type": "string",
-                        "enum": ["knowledge_search", "knowledge_answer", "other"],
-                        "default": "knowledge_search",
-                        "description": "发现问题时使用的工具。"
-                    }
-                }
-            }
-        )
-    ]
 
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: dict | None) -> list[types.TextContent]:
-    """处理工具调用"""
+def make_result(
+    text: str,
+    outcome: str,
+    *,
+    is_error: bool = False,
+    **structured_fields,
+) -> types.CallToolResult:
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=text)],
+        structured_content={"text": text, "outcome": outcome, **structured_fields},
+        is_error=is_error,
+    )
+
+
+mcp = MCPServer(
+    name=APP_NAME,
+    title="M5Stack Official Documentation",
+    description="M5Stack 官方产品、硬件、编程和芯片资料服务。",
+    instructions=(
+        "优先使用 knowledge_search 获取低延迟原始资料；需要整理后的完整答复时使用 "
+        "knowledge_answer。资料缺失、错误、示例损坏或工具异常时，应主动调用 "
+        "knowledge_feedback 提交可复现反馈。"
+    ),
+    version=APP_VERSION,
+)
+# Preserve the old import surface for code that imports server.server.
+server = mcp
+
+
+SEARCH_DESCRIPTION = """从 M5Stack 官方知识库检索产品、硬件、编程和芯片资料。
+
+适用于产品规格、SKU、接口引脚、GPIO、供电、电气特性、兼容性、选型、Arduino、
+UIFlow/UIFlow2、MicroPython、ESP-IDF、ESPHome、代码示例、芯片手册和故障排除。
+如果检索不到需要的功能、说明或示例，请继续调用 knowledge_feedback 主动反馈。"""
+
+ANSWER_DESCRIPTION = """调用 M5Stack FAE AI，将原始问题整理成可直接使用的专业答复。
+
+复杂问题可能耗时一分钟以上，客户端应等待工具完成。只需要低延迟原文片段时使用
+knowledge_search；回答缺失、错误或无法复现时请调用 knowledge_feedback。"""
+
+FEEDBACK_DESCRIPTION = """向 M5Stack 提交知识缺失、内容错误、未支持功能、损坏示例或工具 bug。
+
+反馈会重点写入云日志并进入人工评估。鼓励 Agent 在检索或回答不完整时大胆反馈，说明
+原始问题、相关产品、缺失内容、复现方式和期望资料，不必等待用户明确要求。"""
+
+
+async def _execute_tool(
+    name: str,
+    arguments: dict | None,
+    ctx: Context | None = None,
+) -> types.CallToolResult:
     started = time.monotonic()
     active_tools, peak_tools = cloud_logger.activity_enter("tool")
     request_metadata = dict(REQUEST_METADATA.get())
@@ -289,15 +223,14 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             filter_type = str(arguments.get("filter_type") or "") if arguments else ""
             query_len = len(str(query or ""))
             input_text, input_truncated = bounded_log_text(query)
-
             if not query:
                 outcome = "invalid_arguments"
                 error_type = "missing_query"
-                return [types.TextContent(type="text", text="错误：缺少查询参数")]
+                return make_result("错误：缺少查询参数", outcome, is_error=True)
 
             call = partial(
                 retrieve_knowledge_text,
-                query,
+                str(query),
                 is_chip=is_chip,
                 filter_type=filter_type or None,
             )
@@ -312,29 +245,35 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             except ToolQueueTimeout:
                 outcome = "overloaded"
                 error_type = "queue_timeout"
-                return [types.TextContent(type="text", text="服务当前繁忙，请稍后重试")]
+                return make_result("服务当前繁忙，请稍后重试", outcome, is_error=True)
             except asyncio.TimeoutError:
                 outcome = "timeout"
                 error_type = "tool_timeout"
-                return [types.TextContent(type="text", text=f"Query timed out after {MCP_TOOL_TIMEOUT:.0f}s")]
-            except Exception as exc:
+                return make_result(
+                    f"查询超时：已等待 {MCP_TOOL_TIMEOUT:.0f} 秒，请稍后重试",
+                    outcome,
+                    is_error=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - external SDK boundary
                 error_type = type(exc).__name__
                 logger.error("knowledge_search failed: error_type=%s", error_type)
-                return [types.TextContent(type="text", text=f"查询错误: {str(exc)}")]
+                return make_result(
+                    "查询服务暂时不可用，请稍后重试", outcome, is_error=True
+                )
 
             outcome = "success"
-            result_len = len(str(result))
-            return [types.TextContent(type="text", text=str(result))]
+            result_text = str(result)
+            result_len = len(result_text)
+            return make_result(result_text, outcome)
 
         if name == AI_ANSWER_TOOL_NAME:
             question = arguments.get("question") if arguments else None
             query_len = len(str(question or ""))
             input_text, input_truncated = bounded_log_text(question)
-
             if not question:
                 outcome = "invalid_arguments"
                 error_type = "missing_question"
-                return [types.TextContent(type="text", text="错误：缺少 question 参数")]
+                return make_result("错误：缺少 question 参数", outcome, is_error=True)
 
             call = partial(answer_question, str(question))
             try:
@@ -348,27 +287,40 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             except ToolQueueTimeout:
                 outcome = "overloaded"
                 error_type = "queue_timeout"
-                return [types.TextContent(type="text", text="AI回答服务当前繁忙，请稍后重试")]
+                return make_result(
+                    "AI 回答服务当前繁忙，请稍后重试", outcome, is_error=True
+                )
             except asyncio.TimeoutError:
                 outcome = "timeout"
                 error_type = "tool_timeout"
-                return [types.TextContent(type="text", text=f"AI回答超时：已等待 {AI_TOOL_TIMEOUT:.0f}s，建议客户端延长等待时间或改用 knowledge_search 快速检索。")]
+                return make_result(
+                    f"AI 回答超时：已等待 {AI_TOOL_TIMEOUT:.0f} 秒；可改用 knowledge_search 快速检索",
+                    outcome,
+                    is_error=True,
+                )
             except AIAnswerError as exc:
                 error_type = type(exc).__name__
                 logger.error("knowledge_answer failed: error_type=%s", error_type)
-                return [types.TextContent(type="text", text=f"AI回答错误: {str(exc)}")]
-            except Exception as exc:
+                return make_result(
+                    "AI 回答服务暂时不可用，请稍后重试", outcome, is_error=True
+                )
+            except Exception as exc:  # noqa: BLE001 - external AI provider boundary
                 error_type = type(exc).__name__
                 logger.error("knowledge_answer failed: error_type=%s", error_type)
-                return [types.TextContent(type="text", text=f"AI回答错误: {str(exc)}")]
+                return make_result(
+                    "AI 回答服务暂时不可用，请稍后重试", outcome, is_error=True
+                )
 
             outcome = "success"
-            result_len = len(str(result))
-            return [types.TextContent(type="text", text=str(result))]
+            result_text = str(result)
+            result_len = len(result_text)
+            return make_result(result_text, outcome)
 
         if name == FEEDBACK_TOOL_NAME:
             category = str(arguments.get("category") or "") if arguments else ""
-            severity = str(arguments.get("severity") or "medium") if arguments else "medium"
+            severity = (
+                str(arguments.get("severity") or "medium") if arguments else "medium"
+            )
             source_tool = (
                 str(arguments.get("source_tool") or "knowledge_search")
                 if arguments
@@ -376,9 +328,7 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             )
             input_text, input_truncated = feedback_text(arguments, "feedback", 8000)
             original_question, original_question_truncated = feedback_text(
-                arguments,
-                "original_question",
-                8000,
+                arguments, "original_question", 8000
             )
             product, product_truncated = feedback_text(arguments, "product", 200)
             expected_information, expected_information_truncated = feedback_text(
@@ -388,36 +338,48 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             )
             query_len = len(input_text)
 
-            allowed_categories = {
+            if category not in {
                 "missing_documentation",
                 "incorrect_information",
                 "unsupported_feature",
                 "broken_example",
                 "tool_error",
                 "other",
-            }
-            if category not in allowed_categories:
+            }:
                 outcome = "invalid_arguments"
                 error_type = "invalid_feedback_category"
-                return [types.TextContent(type="text", text="反馈失败：category 不合法")]
+                return make_result(
+                    "反馈失败：category 不合法", outcome, is_error=True, accepted=False
+                )
             if len(input_text) < 10:
                 outcome = "invalid_arguments"
                 error_type = "feedback_too_short"
-                return [types.TextContent(type="text", text="反馈失败：feedback 至少需要 10 个字符")]
+                return make_result(
+                    "反馈失败：feedback 至少需要 10 个字符",
+                    outcome,
+                    is_error=True,
+                    accepted=False,
+                )
             if severity not in {"low", "medium", "high"}:
                 outcome = "invalid_arguments"
                 error_type = "invalid_feedback_severity"
-                return [types.TextContent(type="text", text="反馈失败：severity 不合法")]
+                return make_result(
+                    "反馈失败：severity 不合法", outcome, is_error=True, accepted=False
+                )
             if source_tool not in {"knowledge_search", "knowledge_answer", "other"}:
                 outcome = "invalid_arguments"
                 error_type = "invalid_feedback_source_tool"
-                return [types.TextContent(type="text", text="反馈失败：source_tool 不合法")]
+                return make_result(
+                    "反馈失败：source_tool 不合法",
+                    outcome,
+                    is_error=True,
+                    accepted=False,
+                )
 
             feedback_id = uuid.uuid4().hex
-            mcp_metadata = current_mcp_metadata()
             accepted = cloud_logger.emit(
                 "knowledge_feedback",
-                **{**request_metadata, **mcp_metadata},
+                **{**request_metadata, **current_mcp_metadata(ctx)},
                 feedback_id=feedback_id,
                 category=category,
                 severity=severity,
@@ -437,29 +399,33 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             if not accepted:
                 outcome = "storage_unavailable"
                 error_type = "cloud_log_queue_unavailable"
-                return [
-                    types.TextContent(
-                        type="text",
-                        text="反馈暂未保存：云日志队列不可用，请稍后重试。",
-                    )
-                ]
+                return make_result(
+                    "反馈暂未保存：云日志队列不可用，请稍后重试。",
+                    outcome,
+                    is_error=True,
+                    accepted=False,
+                    feedback_id=None,
+                )
 
             outcome = "success"
             response_text = (
                 f"反馈已接收并排队进入 M5Stack 人工评估流程。feedback_id={feedback_id}"
             )
             result_len = len(response_text)
-            return [types.TextContent(type="text", text=response_text)]
+            return make_result(
+                response_text,
+                outcome,
+                accepted=True,
+                feedback_id=feedback_id,
+            )
 
         error_type = "unknown_tool"
         raise ValueError(f"Unknown tool: {name}")
     finally:
         active_after = cloud_logger.activity_exit("tool")
-        mcp_metadata = current_mcp_metadata()
-        event_metadata = {**request_metadata, **mcp_metadata}
         cloud_logger.emit(
             "mcp_tool_call",
-            **event_metadata,
+            **{**request_metadata, **current_mcp_metadata(ctx)},
             tool_name=name,
             outcome=outcome,
             error_type=error_type,
@@ -476,98 +442,217 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             feedback_id=feedback_id,
         )
 
-# ---------------------------------------------------------
-# 4. 设置 Starlette 和 SSE 传输
-# ---------------------------------------------------------
-sse = SseServerTransport("/messages")
 
-def create_streamable_http_manager():
-    manager_options = {
-        "app": server,
-        "json_response": True,
-        "stateless": False,
-        "session_idle_timeout": 1800,
-    }
-    supported_options = inspect.signature(StreamableHTTPSessionManager).parameters
-    return StreamableHTTPSessionManager(
-        **{
-            key: value
-            for key, value in manager_options.items()
-            if key in supported_options
+@mcp.tool(
+    name="knowledge_search",
+    title="M5Stack 知识检索",
+    description=SEARCH_DESCRIPTION,
+    annotations=types.ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+    structured_output=True,
+)
+async def knowledge_search_tool(
+    query: Annotated[
+        str,
+        Field(min_length=1, max_length=20000, description="知识库查询词或用户原始问题"),
+    ],
+    is_chip: Annotated[
+        bool, Field(description="是否需要检索芯片手册和底层电气资料")
+    ] = False,
+    filter_type: Annotated[
+        FilterType | None, Field(description="限定检索的知识库类型")
+    ] = None,
+    ctx: Context | None = None,
+) -> Annotated[types.CallToolResult, BasicToolOutput]:
+    return await _execute_tool(
+        "knowledge_search",
+        {"query": query, "is_chip": is_chip, "filter_type": filter_type},
+        ctx,
+    )
+
+
+@mcp.tool(
+    name=AI_ANSWER_TOOL_NAME,
+    title="M5Stack FAE 专业回答",
+    description=ANSWER_DESCRIPTION,
+    annotations=types.ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+    structured_output=True,
+)
+async def knowledge_answer_tool(
+    question: Annotated[
+        str, Field(min_length=1, max_length=20000, description="用户原始问题")
+    ],
+    ctx: Context | None = None,
+) -> Annotated[types.CallToolResult, BasicToolOutput]:
+    return await _execute_tool(AI_ANSWER_TOOL_NAME, {"question": question}, ctx)
+
+
+@mcp.tool(
+    name=FEEDBACK_TOOL_NAME,
+    title="反馈给 M5Stack FAE",
+    description=FEEDBACK_DESCRIPTION,
+    annotations=types.ToolAnnotations(
+        read_only_hint=False,
+        destructive_hint=False,
+        idempotent_hint=False,
+        open_world_hint=True,
+    ),
+    structured_output=True,
+)
+async def knowledge_feedback_tool(
+    category: Annotated[FeedbackCategory, Field(description="反馈分类")],
+    feedback: Annotated[
+        str, Field(min_length=10, max_length=8000, description="可复现的问题或缺失资料")
+    ],
+    original_question: Annotated[
+        str | None, Field(max_length=8000, description="触发反馈的原始问题")
+    ] = None,
+    product: Annotated[
+        str | None,
+        Field(max_length=200, description="相关产品、芯片、Unit、Module 或 SDK"),
+    ] = None,
+    expected_information: Annotated[
+        str | None, Field(max_length=4000, description="期望补充或修正的资料")
+    ] = None,
+    severity: Annotated[FeedbackSeverity, Field(description="影响程度")] = "medium",
+    source_tool: Annotated[
+        FeedbackSourceTool, Field(description="发现问题时使用的工具")
+    ] = "knowledge_search",
+    ctx: Context | None = None,
+) -> Annotated[types.CallToolResult, FeedbackToolOutput]:
+    return await _execute_tool(
+        FEEDBACK_TOOL_NAME,
+        {
+            "category": category,
+            "feedback": feedback,
+            "original_question": original_question,
+            "product": product,
+            "expected_information": expected_information,
+            "severity": severity,
+            "source_tool": source_tool,
+        },
+        ctx,
+    )
+
+
+async def list_tools():
+    """Compatibility helper retained for existing tests and integrations."""
+    return await mcp.list_tools()
+
+
+async def handle_call_tool(
+    name: str, arguments: dict | None
+) -> list[types.TextContent]:
+    """Compatibility helper returning the legacy text-content list."""
+    result = await _execute_tool(name, arguments)
+    return [item for item in result.content if isinstance(item, types.TextContent)]
+
+
+mcp_server_config = load_mcp_server_config()
+transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=list(mcp_server_config.allowed_hosts),
+    allowed_origins=list(mcp_server_config.allowed_origins),
+)
+
+sse_transport_app = mcp.sse_app(
+    sse_path="/sse",
+    message_path="/messages/",
+    host="0.0.0.0",
+    transport_security=transport_security,
+)
+streamable_transport_app = mcp.streamable_http_app(
+    streamable_http_path="/mcp",
+    json_response=mcp_server_config.json_response,
+    stateless_http=mcp_server_config.stateless_http,
+    max_request_body_size=mcp_server_config.max_request_body_size,
+    host="0.0.0.0",
+    transport_security=transport_security,
+)
+
+
+class LegacyMessagePathMiddleware:
+    """Serve the legacy no-slash message URL without a 307 redirect."""
+
+    def __init__(self, wrapped_app):
+        self.wrapped_app = wrapped_app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path") == "/messages":
+            scope = dict(scope)
+            scope["path"] = "/messages/"
+            scope["raw_path"] = b"/messages/"
+        await self.wrapped_app(scope, receive, send)
+
+
+async def health(_request):
+    return JSONResponse(
+        {
+            "status": "ok",
+            "server": APP_NAME,
+            "version": APP_VERSION,
+            "mcp_sdk": "2.0.0",
+            "transports": {
+                "streamable_http": "/mcp",
+                "legacy_sse": "/sse",
+                "legacy_messages": "/messages",
+                "stateless_http": mcp_server_config.stateless_http,
+                "json_response": mcp_server_config.json_response,
+            },
+            "cloud_logging": cloud_logger.status(),
+            "rate_limit": rate_limiter.status(),
         }
     )
 
-streamable_http = create_streamable_http_manager()
-
-class SSEHandler:
-    """SSE 端点 - 实现 ASGI 接口，避免 Starlette 用 request_response 包装导致连接关闭时报错"""
-    async def __call__(self, scope, receive, send):
-        async with sse.connect_sse(scope, receive, send) as streams:
-            await server.run(streams[0], streams[1], server.create_initialization_options())
-
-class MessageHandler:
-    """消息处理器 - 实现 ASGI 接口"""
-    async def __call__(self, scope, receive, send):
-        await sse.handle_post_message(scope, receive, send)
-
-class StreamableHTTPHandler:
-    """Streamable HTTP MCP endpoint for clients that do not need SSE responses."""
-    async def __call__(self, scope, receive, send):
-        await streamable_http.handle_request(scope, receive, send)
-
-async def health(request):
-    """健康检查"""
-    return JSONResponse({
-        "status": "ok",
-        "server": app_name,
-        "cloud_logging": cloud_logger.status(),
-        "rate_limit": rate_limiter.status(),
-    })
 
 @contextlib.asynccontextmanager
-async def lifespan(app):
+async def lifespan(_app):
     cloud_logger.start()
     try:
-        if hasattr(streamable_http, "run"):
-            async with streamable_http.run():
-                yield
-        else:
+        async with mcp.session_manager.run():
             yield
     finally:
         tool_executor.shutdown(wait=False, cancel_futures=True)
         ai_tool_executor.shutdown(wait=False, cancel_futures=True)
         cloud_logger.stop()
 
-# 创建 Starlette 应用
+
 starlette_app = Starlette(
     routes=[
-        Route("/sse", endpoint=SSEHandler(), methods=["GET"]),
-        Route("/messages", endpoint=MessageHandler(), methods=["POST"]),
-        Route("/mcp", endpoint=StreamableHTTPHandler(), methods=["GET", "POST", "DELETE"]),
+        *sse_transport_app.routes,
+        *streamable_transport_app.routes,
         Route("/health", endpoint=health, methods=["GET"]),
     ],
     lifespan=lifespan,
 )
+message_compatible_app = LegacyMessagePathMiddleware(starlette_app)
 rate_limited_app = PerIpRateLimitMiddleware(
-    starlette_app,
+    message_compatible_app,
     rate_limiter,
     client_ip_getter=lambda scope: resolve_client_ip_from_scope(
-        scope,
-        cloud_logger.config,
+        scope, cloud_logger.config
     )[0],
     on_blocked=lambda event, **fields: cloud_logger.emit(
         event,
         **{
             **fields,
-            "client_ip": (
-                fields.get("client_ip", "")
-                if cloud_logger.config.collect_client_ip
-                else ""
-            ),
+            "client_ip": fields.get("client_ip", "")
+            if cloud_logger.config.collect_client_ip
+            else "",
         },
     ),
 )
 app = RequestTelemetryMiddleware(rate_limited_app, cloud_logger)
+
 
 if __name__ == "__main__":
     uvicorn.run(

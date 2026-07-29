@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"\nfrom rag import retrieve_knowledge_text\nresult = retrieve_knowledge_text\\(''Core2'', 1, is_chip=True, filter_type=''product''\\)\nprint\\(''查询成功，结果长度:'', len\\(result[''info'']\\)\\)\n\")"
+      "Bash(python -c \"\nfrom rag import retrieve_knowledge_text\nresult = retrieve_knowledge_text\\(''Core2'', 1, is_chip=True, filter_type=''product''\\)\nprint\\(''查询成功，结果长度:'', len\\(result[''info'']\\)\\)\n\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }

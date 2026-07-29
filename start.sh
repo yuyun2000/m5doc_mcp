@@ -58,20 +58,23 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
-# 检查依赖包
 echo "检查 Python 依赖包..."
-MISSING_DEPS=()
-for pkg in mcp fastapi starlette uvicorn volcengine requests; do
-    if ! python3 -c "import $pkg" 2>/dev/null; then
-        MISSING_DEPS+=("$pkg")
-    fi
-done
+VENV_DIR="$SCRIPT_DIR/.venv-mcp2"
+PYTHON_BIN="$VENV_DIR/bin/python"
 
-if [ ${#MISSING_DEPS[@]} -ne 0 ]; then
-    echo -e "${YELLOW}警告: 缺少以下依赖包: ${MISSING_DEPS[*]}${NC}"
-    echo "正在安装依赖包..."
-    pip3 install mcp fastapi starlette uvicorn volcengine requests
-    if [ $? -ne 0 ]; then
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "创建 MCP 2.0 专用虚拟环境..."
+    # 复用服务器现有的 volcengine==1.0.123，避免重新构建其旧版依赖；
+    # 虚拟环境中安装的 mcp==2.0.0 会优先于系统环境的 mcp==1.27。
+    if ! python3 -m venv --system-site-packages "$VENV_DIR"; then
+        echo -e "${RED}虚拟环境创建失败，请先安装 python3-venv${NC}"
+        exit 1
+    fi
+fi
+
+if ! "$PYTHON_BIN" -c "import importlib.metadata, mcp, starlette, uvicorn, volcengine, requests; raise SystemExit(0 if importlib.metadata.version('mcp') == '2.0.0' and importlib.metadata.version('volcengine') == '1.0.123' else 1)" 2>/dev/null; then
+    echo "安装或更新项目依赖..."
+    if ! "$PYTHON_BIN" -m pip install -r requirements.txt; then
         echo -e "${RED}依赖包安装失败${NC}"
         exit 1
     fi
@@ -81,7 +84,7 @@ fi
 echo "启动服务..."
 
 # 运行日志由应用异步上传到火山引擎 TLS，不再创建仓库本地日志文件。
-nohup python3 server.py > /dev/null 2>&1 &
+nohup "$PYTHON_BIN" server.py > /dev/null 2>&1 &
 PID=$!
 
 # 保存 PID
@@ -103,7 +106,7 @@ if ps -p $PID > /dev/null 2>&1; then
     echo "查看状态: ./status.sh"
 else
     echo -e "${RED}[FAIL] 服务启动失败${NC}"
-    echo "请前台运行 python3 server.py 检查启动错误"
+    echo "请前台运行 .venv-mcp2/bin/python server.py 检查启动错误"
     rm -f "$PID_FILE"
     exit 1
 fi

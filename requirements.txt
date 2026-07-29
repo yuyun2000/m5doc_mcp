@@ -1,0 +1,4 @@
+mcp==2.0.0
+volcengine==1.0.123
+requests>=2.31,<3
+

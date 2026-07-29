@@ -19,6 +19,7 @@ venv/
 env/
 ENV/
 .venv
+.venv-mcp2/
 
 # IDE 配置
 .vscode/

@@ -10,6 +10,7 @@ from cloud_logging import (
     AsyncCloudLogger,
     CloudLogConfig,
     CloudLogHandler,
+    RequestTelemetryMiddleware,
     _credential_setting,
     redact_log_message,
     request_metadata_from_scope,
@@ -88,7 +89,9 @@ class CloudLoggingTests(unittest.TestCase):
 
     def test_background_worker_batches_and_uploads(self):
         service = FakeTLSService()
-        logger = AsyncCloudLogger(make_config(), service_factory=lambda _config: service)
+        logger = AsyncCloudLogger(
+            make_config(), service_factory=lambda _config: service
+        )
 
         with patch("cloud_logging.PutLogsV2Logs", LegacyPutLogsV2Logs):
             self.assertTrue(logger.start())
@@ -183,6 +186,38 @@ class CloudLoggingTests(unittest.TestCase):
         self.assertNotIn("secret-value", payload["message"])
 
 
+class RequestTelemetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_expected_oauth_discovery_404_is_not_uploaded(self):
+        logger = AsyncCloudLogger(make_config(enabled=False))
+        emitted = []
+        logger.emit = lambda event, **fields: emitted.append((event, fields)) or True
+
+        async def downstream(_scope, _receive, send):
+            await send({"type": "http.response.start", "status": 404, "headers": []})
+            await send({"type": "http.response.body", "body": b"Not Found"})
+
+        middleware = RequestTelemetryMiddleware(downstream, logger)
+        scope = {
+            "type": "http",
+            "client": ("198.51.100.10", 50000),
+            "headers": [(b"host", b"mcp.m5stack.com")],
+            "method": "GET",
+            "path": "/.well-known/oauth-protected-resource/sse",
+            "scheme": "https",
+            "http_version": "1.1",
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(_message):
+            return None
+
+        await middleware(scope, receive, send)
+
+        self.assertEqual(emitted, [])
+
+
 class ToolConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     async def test_timed_out_worker_keeps_admission_slot_until_it_exits(self):
         release_worker = threading.Event()
@@ -198,6 +233,42 @@ class ToolConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                     timeout=0.01,
                     queue_timeout=0.01,
                 )
+            self.assertTrue(semaphore.locked())
+
+            release_worker.set()
+            deadline = time.monotonic() + 1
+            while semaphore.locked() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            self.assertFalse(semaphore.locked())
+        finally:
+            release_worker.set()
+            executor.shutdown(wait=True)
+
+    async def test_cancelled_worker_keeps_admission_slot_until_it_exits(self):
+        release_worker = threading.Event()
+        worker_started = threading.Event()
+        executor = ThreadPoolExecutor(max_workers=1)
+        semaphore = asyncio.Semaphore(1)
+
+        def blocking_call():
+            worker_started.set()
+            release_worker.wait(1)
+
+        task = asyncio.create_task(
+            run_blocking_tool(
+                semaphore,
+                executor,
+                blocking_call,
+                timeout=1,
+                queue_timeout=0.1,
+            )
+        )
+        try:
+            while not worker_started.is_set():
+                await asyncio.sleep(0.01)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
             self.assertTrue(semaphore.locked())
 
             release_worker.set()

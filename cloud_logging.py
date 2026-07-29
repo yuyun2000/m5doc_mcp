@@ -566,16 +566,24 @@ class RequestTelemetryMiddleware:
             raise
         finally:
             remaining = self.uploader.activity_exit("http")
-            self.uploader.emit(
-                "http_request",
-                **metadata,
-                status_code=status_code,
-                response_bytes=response_bytes,
-                duration_ms=round((time.monotonic() - started) * 1000, 2),
-                active_http_at_start=active,
-                peak_http=peak,
-                active_http_after=remaining,
+            path = str(scope.get("path", ""))
+            # Generic MCP/Node clients commonly probe OAuth discovery variants.
+            # Without OAuth configured these 404s are expected and have no usage value.
+            ignore_oauth_probe = (
+                status_code == 404
+                and path.startswith("/.well-known/oauth-protected-resource")
             )
+            if not ignore_oauth_probe:
+                self.uploader.emit(
+                    "http_request",
+                    **metadata,
+                    status_code=status_code,
+                    response_bytes=response_bytes,
+                    duration_ms=round((time.monotonic() - started) * 1000, 2),
+                    active_http_at_start=active,
+                    peak_http=peak,
+                    active_http_after=remaining,
+                )
             REQUEST_METADATA.reset(token)
 
 

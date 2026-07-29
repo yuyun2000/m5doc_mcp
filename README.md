@@ -1,13 +1,21 @@
 # m5doc_mcp
 m5官方文档的mcp服务器
-地址：https://mcp.m5stack.com/sse
+
+- 最新 Streamable HTTP：https://mcp.m5stack.com/mcp
+- 兼容 SSE：https://mcp.m5stack.com/sse
 通过modelscope连接：https://www.modelscope.cn/mcp/servers/yuyun2000/m5stack-doc-server
 
 ## 安装依赖
 
 ```bash
-pip install mcp fastapi starlette uvicorn volcengine requests
+python3 -m pip install -r requirements.txt
 ```
+
+服务固定使用官方 `mcp==2.0.0`，要求 Python 3.10+；由于生产使用的旧版
+`volcengine==1.0.123` 依赖较旧，推荐部署在 Python 3.10-3.12。`start.sh` 会创建
+`.venv-mcp2` 专用虚拟环境，并使用 `--system-site-packages` 复用服务器
+现有的 `volcengine==1.0.123`。`mcp==2.0.0` 安装在虚拟环境中并优先于系统环境的
+`mcp==1.27`，不会覆盖或破坏其他服务的 MCP 依赖。首次启动需要系统提供 `python3-venv`。
 
 ## 配置说明
 
@@ -69,6 +77,13 @@ cp config.example.json config.json
     "whitelist_ips": ["47.113.125.164"],
     "max_clients": 10000,
     "client_ttl_seconds": 3600
+  },
+  "mcp_server": {
+    "json_response": true,
+    "stateless_http": true,
+    "max_request_body_size": 4194304,
+    "allowed_hosts": ["mcp.m5stack.com", "mcp.m5stack.com:*", "127.0.0.1:*", "localhost:*", "[::1]:*"],
+    "allowed_origins": ["https://mcp.m5stack.com", "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
   }
 }
 ```
@@ -81,6 +96,15 @@ cp config.example.json config.json
 - TLS 默认复用 `volcengine.ak/sk`，也可通过部署环境变量覆盖；生产环境推荐使用仅有目标日志主题写权限的专用密钥
 - 示例文件只保留云日志字段名和占位符；真实密钥、Topic 及采集参数仅配置在被 Git 忽略的 `config.json` 或部署环境变量中
 - `trusted_proxies` 默认仅信任本机 Nginx。只有部署了其他反向代理时，才把其明确的 CIDR 加入列表，避免客户端伪造转发 IP
+- `allowed_hosts` 和 `allowed_origins` 是 SDK v2 的传输安全白名单；增加域名或反向代理入口时必须同步更新，禁止在公网关闭校验
+
+### MCP v2 与兼容端点
+
+- `/mcp` 同时支持 MCP 2026-07-28 `server/discover` 和旧版 `initialize`；新协议请求使用官方规定的 `MCP-Protocol-Version`、`MCP-Method` 与请求 `_meta`。
+- `/mcp` 默认使用 JSON 响应和无会话旧协议模式，普通工具请求可横向扩展，不依赖 `Mcp-Session-Id`。
+- `/sse` 和 `/messages` 保留给旧客户端；SSE 会广播规范的 `/messages/` 地址，服务端也兼容无尾斜杠的 `/messages` 且不会返回 307。SSE 是长连接，多实例部署仍需要粘性路由或共享连接路由能力。
+- 工具成功和失败结果都保留文本 `content`，并额外提供 `structuredContent`；旧客户端继续读取文本，新客户端可直接消费结构化字段。
+- SDK 在 POST 层限制请求体为 4 MiB，并强制校验 Content-Type、Host 和 Origin。
 
 ### 云日志与用量统计
 
@@ -90,6 +114,7 @@ cp config.example.json config.json
 - 原始查询可能含个人信息，生产环境必须限制 TLS Topic 的访问权限并设置合适的日志保留周期；可用 `M5DOC_LOG_INPUT_MAX_CHARS` 调整单条输入上限。
 - 日志队列满、TLS 超时或云端故障时，业务请求继续执行；`/health` 的 `cloud_logging` 字段会显示队列、丢弃、上传失败和并发状态。
 - 如当地隐私政策不允许保存原始 IP，可设置 `M5DOC_TLS_COLLECT_CLIENT_IP=false`；加盐指纹仍可用于近似去重统计。
+- 未配置 OAuth 时，`/.well-known/oauth-protected-resource*` 的预期 404 探测不会上传，避免无效日志占量；其他异常请求仍正常记录。
 
 ### 按来源 IP 限流
 
@@ -144,6 +169,13 @@ python server.py
 ```
 
 服务将在 `http://0.0.0.0:5058` 启动。
+
+协议回归和基础测试：
+
+```bash
+python3 -m py_compile server.py rag.py ai_answer.py cloud_logging.py rate_limit.py mcp_config.py
+python3 -m unittest discover -s tests -v
+```
 
 ## 安全说明
 

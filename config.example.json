@@ -42,5 +42,23 @@
         "whitelist_ips": ["47.113.125.164"],
         "max_clients": 10000,
         "client_ttl_seconds": 3600
+    },
+    "mcp_server": {
+        "json_response": true,
+        "stateless_http": true,
+        "max_request_body_size": 4194304,
+        "allowed_hosts": [
+            "mcp.m5stack.com",
+            "mcp.m5stack.com:*",
+            "127.0.0.1:*",
+            "localhost:*",
+            "[::1]:*"
+        ],
+        "allowed_origins": [
+            "https://mcp.m5stack.com",
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+            "http://[::1]:*"
+        ]
     }
 }

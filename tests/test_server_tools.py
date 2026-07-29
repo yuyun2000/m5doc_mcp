@@ -18,6 +18,13 @@ class ServerToolTests(unittest.IsolatedAsyncioTestCase):
             [tool.name for tool in tools],
             ["knowledge_search", "knowledge_answer", "knowledge_feedback"],
         )
+        self.assertEqual(tools[0].input_schema["required"], ["query"])
+        self.assertEqual(
+            set(tools[0].output_schema["properties"]),
+            {"text", "outcome"},
+        )
+        self.assertTrue(tools[0].annotations.read_only_hint)
+        self.assertFalse(tools[2].annotations.read_only_hint)
 
     async def test_search_cloud_log_contains_original_query(self):
         query = "AtomS3 CAN Unit wiring example"
@@ -34,6 +41,20 @@ class ServerToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["input_text"], query)
         self.assertFalse(event["input_truncated"])
         self.assertIn("result", result[0].text)
+
+    async def test_registered_search_returns_text_and_structured_content(self):
+        with (
+            patch.object(server, "retrieve_knowledge_text", return_value="official result"),
+            patch.object(server.cloud_logger, "emit", return_value=True),
+        ):
+            result = await server.mcp.call_tool(
+                "knowledge_search",
+                {"query": "AtomS3", "is_chip": False},
+            )
+
+        self.assertEqual(result.content[0].text, "official result")
+        self.assertEqual(result.structured_content["text"], "official result")
+        self.assertEqual(result.structured_content["outcome"], "success")
 
     async def test_answer_cloud_log_contains_original_question(self):
         question = "Why does CoreS3 fail to initialize the camera?"
