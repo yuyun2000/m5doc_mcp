@@ -9,7 +9,6 @@ cd "$SCRIPT_DIR"
 # 配置
 SERVICE_NAME="m5doc_mcp"
 PID_FILE="$SCRIPT_DIR/${SERVICE_NAME}.pid"
-LOG_FILE="$SCRIPT_DIR/${SERVICE_NAME}.log"
 PORT=5058
 
 # 颜色输出
@@ -62,7 +61,7 @@ fi
 # 检查依赖包
 echo "检查 Python 依赖包..."
 MISSING_DEPS=()
-for pkg in mcp fastapi uvicorn volcengine requests; do
+for pkg in mcp fastapi starlette uvicorn volcengine requests; do
     if ! python3 -c "import $pkg" 2>/dev/null; then
         MISSING_DEPS+=("$pkg")
     fi
@@ -71,7 +70,7 @@ done
 if [ ${#MISSING_DEPS[@]} -ne 0 ]; then
     echo -e "${YELLOW}警告: 缺少以下依赖包: ${MISSING_DEPS[*]}${NC}"
     echo "正在安装依赖包..."
-    pip3 install mcp fastapi uvicorn volcengine requests
+    pip3 install mcp fastapi starlette uvicorn volcengine requests
     if [ $? -ne 0 ]; then
         echo -e "${RED}依赖包安装失败${NC}"
         exit 1
@@ -80,10 +79,9 @@ fi
 
 # 启动服务
 echo "启动服务..."
-echo "日志文件: $LOG_FILE"
-echo ""
 
-nohup python3 server.py > "$LOG_FILE" 2>&1 &
+# 运行日志由应用异步上传到火山引擎 TLS，不再创建仓库本地日志文件。
+nohup python3 server.py > /dev/null 2>&1 &
 PID=$!
 
 # 保存 PID
@@ -94,19 +92,18 @@ sleep 2
 
 # 检查服务是否成功启动
 if ps -p $PID > /dev/null 2>&1; then
-    echo -e "${GREEN}✓ 服务启动成功!${NC}"
+    echo -e "${GREEN}[OK] 服务启动成功!${NC}"
     echo ""
     echo "服务信息:"
     echo "  PID:  $PID"
     echo "  端口: $PORT"
-    echo "  日志: $LOG_FILE"
     echo ""
-    echo "查看日志: tail -f $LOG_FILE"
+    echo "云日志状态: curl http://127.0.0.1:$PORT/health"
     echo "停止服务: ./stop.sh"
     echo "查看状态: ./status.sh"
 else
-    echo -e "${RED}✗ 服务启动失败${NC}"
-    echo "请查看日志文件: $LOG_FILE"
+    echo -e "${RED}[FAIL] 服务启动失败${NC}"
+    echo "请前台运行 python3 server.py 检查启动错误"
     rm -f "$PID_FILE"
     exit 1
 fi

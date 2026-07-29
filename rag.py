@@ -1,29 +1,17 @@
 import json
+import re
 import requests
 import os
 import logging
+import time
+import threading
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from volcengine.auth.SignerV4 import SignerV4
 from volcengine.base.Request import Request
 from volcengine.Credentials import Credentials
-
-# 配置日志系统
-def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler()
-        ]
-    )
-
-    # 在 Unix 系统上设置正确的输出编码
-    import sys
-    if sys.platform != 'win32':
-        import os
-        os.environ['PYTHONIOENCODING'] = 'utf-8'
-
-setup_logging()
 
 # 创建专门的日志记录器
 logger = logging.getLogger('m5doc_rag')
@@ -50,11 +38,55 @@ ak = _config['ak']
 sk = _config['sk']
 g_knowledge_base_domain = _config['knowledge_base_domain']
 REQUEST_TIMEOUT = _config['request_timeout']
+CONNECT_TIMEOUT = _config.get('connect_timeout', min(5, REQUEST_TIMEOUT))
+READ_TIMEOUT = _config.get('read_timeout', REQUEST_TIMEOUT)
+MAX_RETRIES = _config.get('max_retries', 2)
+POOL_CONNECTIONS = _config.get('pool_connections', 32)
+POOL_MAXSIZE = _config.get('pool_maxsize', 64)
+INTERNAL_WORKERS = _config.get('internal_workers', 64)
 KNOWLEDGE_BASE_NAME = _config['knowledge_base_name']
 PROJECT = _config['project']
 REGION = _config['region']
 SERVICE = _config['service']
 DEFAULT_RESULT_LIMIT = 10
+
+
+def create_http_session():
+    retry = Retry(
+        total=MAX_RETRIES,
+        connect=MAX_RETRIES,
+        read=MAX_RETRIES,
+        status=MAX_RETRIES,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        pool_connections=POOL_CONNECTIONS,
+        pool_maxsize=POOL_MAXSIZE,
+        max_retries=retry,
+        pool_block=True,
+    )
+    session = requests.Session()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+thread_local = threading.local()
+internal_executor = ThreadPoolExecutor(
+    max_workers=INTERNAL_WORKERS,
+    thread_name_prefix="m5doc-rag",
+)
+
+
+def get_http_session():
+    session = getattr(thread_local, "http_session", None)
+    if session is None:
+        session = create_http_session()
+        thread_local.http_session = session
+    return session
 
 def prepare_request(method, path, params=None, data=None, doseq=0):
     """
@@ -132,6 +164,7 @@ def search_knowledge_documents(query, limit_num=10, type_filter=None):
     """
     method = "POST"
     path = "/api/knowledge/collection/search_knowledge"
+    start_time = time.monotonic()
     
     # 构建基础请求参数（统一使用一个知识库）
     request_params = {
@@ -169,13 +202,31 @@ def search_knowledge_documents(query, limit_num=10, type_filter=None):
         }
     
     info_req = prepare_request(method=method, path=path, data=request_params)
-    rsp = requests.request(
-        method=info_req.method,
-        url=f"http://{g_knowledge_base_domain}{info_req.path}",
-        headers=info_req.headers,
-        data=info_req.body
-    )
-    return rsp.text
+    try:
+        rsp = get_http_session().request(
+            method=info_req.method,
+            url=f"http://{g_knowledge_base_domain}{info_req.path}",
+            headers=info_req.headers,
+            data=info_req.body,
+            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+        )
+        rsp.raise_for_status()
+        logger.info(
+            "knowledge request ok: query_len=%s limit=%s elapsed=%.2fs",
+            len(query),
+            limit_num,
+            time.monotonic() - start_time,
+        )
+        return rsp.text
+    except requests.RequestException as exc:
+        logger.error(
+            "knowledge request failed: query_len=%s limit=%s elapsed=%.2fs error_type=%s",
+            len(query),
+            limit_num,
+            time.monotonic() - start_time,
+            type(exc).__name__,
+        )
+        raise
 
 def retrieve_knowledge_text(query_text, *legacy_args, is_chip=True, filter_type=None, **legacy_kwargs):
     """
@@ -190,7 +241,7 @@ def retrieve_knowledge_text(query_text, *legacy_args, is_chip=True, filter_type=
     返回:
         dict: 包含匹配到的知识库内容的字典
     """
-    # Ignore legacy num arguments; always return the first 10 results.
+    # 兼容旧调用：旧版本第二个位置参数或 num 关键字会被忽略，统一返回前10条。
     if len(legacy_args) >= 2:
         is_chip = legacy_args[1]
     if len(legacy_args) >= 3:
@@ -223,18 +274,26 @@ def retrieve_knowledge_text(query_text, *legacy_args, is_chip=True, filter_type=
     elif filter_type == "esphome":
         # 查询esphome官方文档 (type=11)
         type_filter = create_type_filter([11])
-    # ----------------- 其余逻辑保持不变 ---------------------
+
     limit_num = DEFAULT_RESULT_LIMIT
 
-    logger.info("=== 知识库查询请求 ===".encode('utf-8').decode('utf-8'))
-    logger.info(f"查询文本: {query_text}".encode('utf-8').decode('utf-8'))
-    logger.info(f"限制数量: {limit_num}".encode('utf-8').decode('utf-8'))
-    logger.info(f"过滤类型: {filter_type}".encode('utf-8').decode('utf-8'))
-    logger.info(f"是否查询芯片文档: {is_chip}".encode('utf-8').decode('utf-8'))
+    logger.info(
+        "knowledge retrieval started: query_len=%s limit=%s filter_type=%s is_chip=%s",
+        len(query_text),
+        limit_num,
+        filter_type or "",
+        is_chip,
+    )
 
     # 调用知识库检索（查询type=1,2,3的文档）
-    rsp_txt_doc = search_knowledge_documents(query_text, limit_num, type_filter)
-    logger.debug(f"知识库原始响应前200字符: {rsp_txt_doc[:200]}...")
+    cleaned_query_text = re.sub(r'm5stack', '', query_text, flags=re.IGNORECASE).strip()
+    doc_future = internal_executor.submit(search_knowledge_documents, cleaned_query_text, limit_num, type_filter)
+    pdf_future = None
+    if is_chip:
+        pdf_filter = create_type_filter([4])
+        pdf_future = internal_executor.submit(search_knowledge_documents, query_text, 10, pdf_filter)
+
+    rsp_txt_doc = doc_future.result()
     rsp_doc = json.loads(rsp_txt_doc)
     
     # 解析检索结果
@@ -247,8 +306,8 @@ def retrieve_knowledge_text(query_text, *legacy_args, is_chip=True, filter_type=
         if isinstance(rsp_data_doc, str):
             try:
                 rsp_data_doc = json.loads(rsp_data_doc)
-            except Exception as e:
-                logger.error(f"解析产品文档JSON失败: {str(e)}")
+            except Exception as exc:
+                logger.error("product document JSON parse failed: error_type=%s", type(exc).__name__)
                 rsp_data_doc = {"result_list": []}
         # 提取文档内容
         for point in rsp_data_doc.get("result_list", []):
@@ -260,9 +319,7 @@ def retrieve_knowledge_text(query_text, *legacy_args, is_chip=True, filter_type=
     # 如果需要查询芯片文档（PDF），额外查询type=4的文档
     if is_chip:
         matched_content += "以下是芯片数据手册匹配到的信息：\n"
-        # 查询PDF文档 (type=4)
-        pdf_filter = create_type_filter([4])
-        rsp_txt_pdf = search_knowledge_documents(query_text, 10, pdf_filter)
+        rsp_txt_pdf = pdf_future.result()
         rsp_pdf = json.loads(rsp_txt_pdf)
         if rsp_pdf["code"] == 0:
             rsp_data_pdf = rsp_pdf["data"]
@@ -270,8 +327,8 @@ def retrieve_knowledge_text(query_text, *legacy_args, is_chip=True, filter_type=
             if isinstance(rsp_data_pdf, str):
                 try:
                     rsp_data_pdf = json.loads(rsp_data_pdf)
-                except Exception as e:
-                    logger.error(f"解析PDF文档JSON失败: {str(e)}")
+                except Exception as exc:
+                    logger.error("PDF document JSON parse failed: error_type=%s", type(exc).__name__)
                     rsp_data_pdf = {"result_list": []}
             # 提取PDF文档内容
             for point in rsp_data_pdf.get("result_list", []):

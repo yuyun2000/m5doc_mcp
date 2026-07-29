@@ -60,10 +60,10 @@ done
 
 # 检查是否成功停止
 if ps -p "$PID" > /dev/null 2>&1; then
-    echo -e "${RED}✗ 服务停止失败${NC}"
+    echo -e "${RED}[FAIL] 服务停止失败${NC}"
     echo "请手动执行: kill -9 $PID"
     exit 1
 else
-    echo -e "${GREEN}✓ 服务已停止${NC}"
+    echo -e "${GREEN}[OK] 服务已停止${NC}"
     rm -f "$PID_FILE"
 fi

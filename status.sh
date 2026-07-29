@@ -9,7 +9,6 @@ cd "$SCRIPT_DIR"
 # 配置
 SERVICE_NAME="m5doc_mcp"
 PID_FILE="$SCRIPT_DIR/${SERVICE_NAME}.pid"
-LOG_FILE="$SCRIPT_DIR/${SERVICE_NAME}.log"
 PORT=5058
 
 # 颜色输出
@@ -66,15 +65,12 @@ if command -v lsof &> /dev/null; then
     fi
 fi
 
-# 显示最近的日志
-if [ -f "$LOG_FILE" ]; then
+# 显示云日志队列和上传状态，不读取本地日志文件。
+if command -v curl &> /dev/null; then
     echo ""
-    echo "最近日志 (最后 10 行):"
-    echo "----------------------------------------"
-    tail -n 10 "$LOG_FILE" | sed 's/^/  /'
-    echo "----------------------------------------"
+    echo "服务健康与云日志状态:"
+    curl --silent --show-error --max-time 3 "http://127.0.0.1:$PORT/health" || true
     echo ""
-    echo "查看完整日志: tail -f $LOG_FILE"
 fi
 
 echo ""

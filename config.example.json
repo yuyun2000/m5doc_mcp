@@ -4,9 +4,43 @@
         "sk": "your_secret_key_here",
         "knowledge_base_domain": "api-knowledgebase.mlp.cn-beijing.volces.com",
         "request_timeout": 30,
+        "connect_timeout": 5,
+        "read_timeout": 30,
+        "max_retries": 2,
+        "pool_connections": 32,
+        "pool_maxsize": 64,
+        "internal_workers": 64,
         "knowledge_base_name": "m5stack",
         "project": "default",
         "region": "cn-north-1",
         "service": "air"
+    },
+    "openai_compatible": {
+        "base_url": "https://chat.m5stack.com",
+        "api_key": "your_openai_compatible_api_key_here",
+        "model": "m5stack-fae",
+        "chat_completions_path": "/v1/chat/completions",
+        "connect_timeout": 10,
+        "read_timeout": 240,
+        "max_retries": 1,
+        "pool_connections": 8,
+        "pool_maxsize": 16
+    },
+    "cloud_logging": {
+        "enabled": true,
+        "endpoint": "tls-cn-beijing.volces.com",
+        "region": "cn-beijing",
+        "access_key": "your_tls_access_key_here",
+        "secret_key": "your_tls_secret_key_here",
+        "topic_id": "your_tls_topic_id_here",
+        "source": "m5doc-mcp"
+    },
+    "rate_limit": {
+        "enabled": true,
+        "requests_per_minute": 120,
+        "burst": 30,
+        "whitelist_ips": ["47.113.125.164"],
+        "max_clients": 10000,
+        "client_ttl_seconds": 3600
     }
 }

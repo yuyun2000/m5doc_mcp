@@ -30,7 +30,7 @@ echo -e "${YELLOW}步骤 2/2: 启动服务${NC}"
 
 if [ $? -eq 0 ]; then
     echo ""
-    echo -e "${GREEN}✓ 服务重启完成${NC}"
+    echo -e "${GREEN}[OK] 服务重启完成${NC}"
 else
     exit 1
 fi
